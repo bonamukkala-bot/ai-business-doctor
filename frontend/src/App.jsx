@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
 import './App.css'
+import { API_BASE_URL } from './config'
 
 function App() {
   const [insights, setInsights] = useState(null)
@@ -37,7 +38,7 @@ function App() {
     setQuestion('')
 
     try {
-      const res = await axios.post('http://127.0.0.1:8000/ask', {
+      const res = await axios.post(`${API_BASE_URL}/ask`, {
         question: finalQuestion,
         session_id: sessionIdRef.current
       })
@@ -54,7 +55,7 @@ function App() {
     setExecLoading(true)
     setExecError(null)
     try {
-      const res = await axios.get('http://127.0.0.1:8000/executive-summary')
+      const res = await axios.get(`${API_BASE_URL}/executive-summary`)
       setExecSummary(res.data)
     } catch (err) {
       setExecError("Couldn't load the executive summary. Make sure the backend is running.")
@@ -64,7 +65,7 @@ function App() {
   }
 
   useEffect(() => {
-    axios.get('http://127.0.0.1:8000/insights')
+    axios.get(`${API_BASE_URL}/insights`)
       .then(res => {
         setInsights(res.data)
         setLoading(false)
@@ -166,7 +167,7 @@ function App() {
             🎤 Board Meeting Mode
           </button>
           <a
-            href="http://127.0.0.1:8000/export-report"
+            href={`${API_BASE_URL}/export-report`}
             download="business_diagnosis_report.pdf"
             style={{
               padding: '10px 18px',
