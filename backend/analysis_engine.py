@@ -1747,6 +1747,327 @@ def generate_action_plan(user_id: str, authenticated_supabase_client) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CASH FLOW PREDICTOR
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# DATA REALITY CHECK (read this before touching the logic):
+#
+# The sales schema is: date, product, category, units_sold, unit_cost,
+# unit_price, revenue, cost, profit
+#
+# - `revenue` = cash received from customers (cash-basis retail, no AR lag)
+# - `cost`    = cost of goods sold for that transaction row (COGS cash out)
+# - `profit`  = revenue - cost  (net daily cash contribution per row)
+#
+# The inventory schema has: product, category, current_stock, unit_cost,
+# unit_price  — no purchase-order history, no payables ledger.
+#
+# CONCLUSION: "current cash position" is an ESTIMATE derived from trailing
+# cumulative (revenue - cost).  It represents cumulative operating cash
+# generated from sales, NOT a bank balance.  This is clearly labelled in
+# the return value.  No payroll, rent, or other fixed expenses are in the
+# schema — those are not fabricated.
+
+# ── Cash Flow threshold constants ────────────────────────────────────────────
+# Days-until-zero is the most intuitive risk signal for a small retailer.
+# Named constants so they're easy to tune without hunting the logic.
+CF_HEALTHY_MIN_DAYS_BUFFER = 15   # ≥15 days of runway  → Healthy
+CF_MEDIUM_MIN_DAYS_BUFFER  = 7    # 7–14 days of runway → Medium Risk
+# < 7 days                        → High Risk (includes negative projection)
+
+# Trailing window used for slope/average calculation.  30 days mirrors
+# MIN_DATA_DAYS and the forecast_next_period_profit window.
+CF_TRAILING_WINDOW_DAYS = 30
+
+# Minimum days of history required before we'll project anything.
+CF_MIN_DATA_DAYS = 15
+
+# Dead-inventory threshold: ≥45 days of stock at current demand rate.
+# Reuses the same constant as detect_anomalies() so numbers stay consistent.
+CF_OVERSTOCK_DAYS_THRESHOLD = 45
+
+# Inventory spend is "large" relative to revenue if it accounts for
+# ≥60 % of total revenue — only then do we recommend reducing purchases.
+CF_HIGH_INVENTORY_SPEND_RATIO = 0.60
+
+
+def _cf_risk_level(projected_value: float, daily_avg_net: float) -> str:
+    """
+    Assign Healthy / Medium Risk / High Risk to a projected cash value.
+
+    Uses days-of-runway: how many days at the current average daily cash
+    burn (negative net) or cushion (positive net) before cash hits zero.
+
+    If net flow is positive the position is always at least Healthy (cash
+    is growing).  Risk only applies when the projected value itself is low
+    relative to the burn rate.
+    """
+    if daily_avg_net >= 0:
+        # Positive or flat net — runway is infinite; level depends on buffer
+        if projected_value >= 0:
+            return "Healthy"
+        # Projected value slipped negative despite positive avg (data edge case)
+        return "High Risk"
+
+    # Negative daily net: calculate days until zero from projected value
+    if projected_value <= 0:
+        return "High Risk"
+
+    days_buffer = projected_value / abs(daily_avg_net)
+    if days_buffer >= CF_HEALTHY_MIN_DAYS_BUFFER:
+        return "Healthy"
+    if days_buffer >= CF_MEDIUM_MIN_DAYS_BUFFER:
+        return "Medium Risk"
+    return "High Risk"
+
+
+def predict_cash_flow(user_id: str, authenticated_supabase_client) -> dict:
+    """
+    Projects cash position at +7, +15, and +30 days from today.
+
+    WHAT "current cash position" MEANS HERE
+    ────────────────────────────────────────
+    It is the cumulative sum of (revenue - cost) over the trailing
+    CF_TRAILING_WINDOW_DAYS days.  This is a cash-basis operating cash
+    proxy — it answers "how much cash did sales generate recently?" not
+    "what is in the bank account?"  The response field `is_estimate` is
+    always True and `position_basis` explains the derivation so the UI
+    can label it honestly.
+
+    PROJECTION METHOD
+    ─────────────────
+    Same OLS linear trend as forecast_next_period_profit():
+      - Fit a degree-1 polynomial (np.polyfit) to daily net cash flow
+        (revenue - cost) over the trailing window.
+      - Extrapolate the fitted line to day +7, +15, +30.
+      - Cumulate from the current position.
+    This is deliberately simple and explainable.
+
+    RECOMMENDATIONS
+    ───────────────
+    Only generated when the underlying data actually supports them:
+    - High inventory spend → only if COGS / revenue ≥ CF_HIGH_INVENTORY_SPEND_RATIO
+    - Liquidate dead stock → only if recommend_stop_selling() returns candidates
+      (reuses existing function, no new detection logic)
+    - Critical reorder risk → only if recommend_reorder() flags urgent items
+      (cash at risk = days_of_stock_left × daily_avg_demand × profit_per_unit)
+    """
+    sales, inventory = load_data(user_id)
+
+    unique_days = sales["date"].dt.date.nunique() if not sales.empty else 0
+
+    if sales.empty or unique_days < CF_MIN_DATA_DAYS:
+        return {
+            "insufficient_data": True,
+            "data_sufficiency_note": (
+                f"Need at least {CF_MIN_DATA_DAYS} days of sales history for cash flow "
+                f"projections. Currently have {unique_days} day(s) of data."
+            ),
+            "current_cash_position": None,
+            "is_estimate": True,
+            "position_basis": None,
+            "projections": [],
+            "recommendations": [],
+            "confidence": 0.0,
+        }
+
+    # ── Ensure cost column exists ────────────────────────────────────────
+    # `cost` is present in the schema but guard against legacy uploads
+    # that only have revenue/profit.
+    if "cost" in sales.columns:
+        sales["net_cash"] = sales["revenue"] - sales["cost"]
+    else:
+        # Fallback: profit is already revenue - cost, so use it directly
+        sales["net_cash"] = sales["profit"]
+
+    max_date = sales["date"].max()
+    trailing_start = max_date - pd.Timedelta(days=CF_TRAILING_WINDOW_DAYS - 1)
+    trailing = sales[sales["date"] >= trailing_start].copy()
+
+    # Daily aggregates over trailing window
+    daily = (
+        trailing.groupby("date")
+        .agg(
+            daily_revenue=("revenue", "sum"),
+            daily_cost=("cost" if "cost" in trailing.columns else "net_cash", "sum"),
+            daily_net=("net_cash", "sum"),
+        )
+        .reset_index()
+        .sort_values("date")
+    )
+
+    # ── Current cash position (trailing cumulative net) ──────────────────
+    current_cash_position = round(float(daily["daily_net"].sum()), 2)
+    trailing_days_actual = int(daily["date"].nunique())
+
+    # Confidence: fraction of trailing window that has actual data
+    confidence = round(min(1.0, trailing_days_actual / CF_TRAILING_WINDOW_DAYS), 2)
+
+    # Average daily net over trailing window
+    daily_avg_net = float(daily["daily_net"].mean())
+
+    # ── OLS trend fit (same pattern as forecast_next_period_profit) ──────
+    x = np.arange(len(daily))
+    y = daily["daily_net"].values
+
+    if len(daily) >= 2:
+        slope, intercept = np.polyfit(x, y, 1)
+    else:
+        slope, intercept = 0.0, daily_avg_net
+
+    # Project daily net cash for next 30 days from today
+    horizon = 30
+    future_x = np.arange(len(daily), len(daily) + horizon)
+    future_daily = slope * future_x + intercept
+    # No floor here — negative cash flow is meaningful information
+
+    # Cumulate forward from current_cash_position
+    cumulative = current_cash_position + np.cumsum(future_daily)
+
+    def _risk(proj_val: float) -> str:
+        return _cf_risk_level(proj_val, daily_avg_net)
+
+    projections = [
+        {
+            "day": 7,
+            "label": "+7 days",
+            "projected_cash": round(float(cumulative[6]), 2),
+            "risk_level": _risk(float(cumulative[6])),
+        },
+        {
+            "day": 15,
+            "label": "+15 days",
+            "projected_cash": round(float(cumulative[14]), 2),
+            "risk_level": _risk(float(cumulative[14])),
+        },
+        {
+            "day": 30,
+            "label": "+30 days",
+            "projected_cash": round(float(cumulative[29]), 2),
+            "risk_level": _risk(float(cumulative[29])),
+        },
+    ]
+
+    # Chart series: current + all 30 projected days
+    chart_series = [{"day": 0, "label": "Today", "projected_cash": round(current_cash_position, 2)}]
+    for i, val in enumerate(cumulative):
+        chart_series.append({"day": i + 1, "label": f"+{i+1}d", "projected_cash": round(float(val), 2)})
+
+    # ── Recommendations from real detected patterns ───────────────────────
+    recommendations = []
+
+    # 1. High COGS spend — only recommend if actually detected
+    total_trailing_revenue = float(daily["daily_revenue"].sum())
+    if "cost" in sales.columns:
+        total_trailing_cost = float(daily["daily_cost"].sum())
+    else:
+        total_trailing_cost = total_trailing_revenue - float(daily["daily_net"].sum())
+
+    cogs_ratio = total_trailing_cost / total_trailing_revenue if total_trailing_revenue > 0 else 0.0
+
+    if cogs_ratio >= CF_HIGH_INVENTORY_SPEND_RATIO:
+        potential_saving = round((cogs_ratio - 0.55) * total_trailing_revenue, 2)
+        recommendations.append({
+            "title": "Reduce inventory purchase spend",
+            "explanation": (
+                f"Cost of goods is {cogs_ratio * 100:.1f}% of revenue over the last "
+                f"{trailing_days_actual} days — above the 60% threshold that typically "
+                f"signals margin pressure. Negotiating supplier terms or pausing low-margin "
+                f"reorders could improve net cash by approximately Rs {potential_saving:,.0f} "
+                f"over the next {trailing_days_actual} days."
+            ),
+            "financial_impact": potential_saving,
+            "impact_basis": f"Reducing COGS ratio from {cogs_ratio*100:.1f}% to 55% on Rs {total_trailing_revenue:,.0f} trailing revenue",
+        })
+
+    # 2. Dead / slow-moving stock — reuse recommend_stop_selling() directly
+    if len(daily) >= 15:  # needs enough history
+        dead_stock_items = recommend_stop_selling(sales, inventory)
+        if dead_stock_items:
+            total_capital_freed = 0.0
+            for item in dead_stock_items:
+                stock_row = inventory[inventory["product"] == item["product"]]
+                if not stock_row.empty:
+                    capital = (
+                        float(stock_row["current_stock"].values[0]) *
+                        float(stock_row["unit_cost"].values[0])
+                    )
+                    total_capital_freed += capital
+
+            if total_capital_freed > 0:
+                top_names = ", ".join(i["product"] for i in dead_stock_items[:2])
+                recommendations.append({
+                    "title": "Liquidate slow-moving stock",
+                    "explanation": (
+                        f"{top_names} {'and others' if len(dead_stock_items) > 2 else ''} "
+                        f"are selling below the 25th-percentile demand rate and contributing "
+                        f"below-median profit. Liquidating these items would free up approximately "
+                        f"Rs {total_capital_freed:,.0f} in tied-up capital."
+                    ),
+                    "financial_impact": round(total_capital_freed, 2),
+                    "impact_basis": f"Capital tied up in current stock of {len(dead_stock_items)} slow-moving product(s)",
+                })
+
+    # 3. Urgent reorder risk — cash at risk if stockout occurs
+    reorder_items = recommend_reorder(sales, inventory)
+    if reorder_items:
+        # Profit at risk = days_until_stockout × daily_avg_profit per product
+        profit_per_unit = (
+            sales.groupby("product")
+            .apply(lambda g: g["profit"].sum() / g["units_sold"].sum() if g["units_sold"].sum() > 0 else 0)
+        )
+        cash_at_risk = 0.0
+        for item in reorder_items:
+            ppu = float(profit_per_unit.get(item["product"], 0))
+            cash_at_risk += item["daily_avg_demand"] * ppu * item["days_of_stock_left"]
+
+        if cash_at_risk > 0:
+            urgent_names = ", ".join(i["product"] for i in reorder_items[:2])
+            recommendations.append({
+                "title": "Reorder urgent items to protect cash inflow",
+                "explanation": (
+                    f"{urgent_names} {'and others' if len(reorder_items) > 2 else ''} "
+                    f"will stock out within {min(i['days_of_stock_left'] for i in reorder_items):.0f}–"
+                    f"{max(i['days_of_stock_left'] for i in reorder_items):.0f} days. "
+                    f"Stockouts directly block cash inflow — estimated Rs {cash_at_risk:,.0f} "
+                    f"in profit at risk if reorders are not placed immediately."
+                ),
+                "financial_impact": round(cash_at_risk, 2),
+                "impact_basis": f"Projected profit loss from stockout over remaining days of stock for {len(reorder_items)} product(s)",
+            })
+
+    # Sort recommendations by financial_impact descending
+    recommendations.sort(key=lambda r: r["financial_impact"], reverse=True)
+
+    trend_direction = "upward" if slope > 1 else ("downward" if slope < -1 else "flat")
+
+    return {
+        "insufficient_data": False,
+        "data_sufficiency_note": None,
+        # Position
+        "current_cash_position": current_cash_position,
+        "is_estimate": True,
+        "position_basis": (
+            f"Cumulative (revenue − cost of goods) over the last {trailing_days_actual} days "
+            f"of sales data. This is a cash-basis operating proxy, not a bank balance. "
+            f"Fixed expenses (rent, payroll, utilities) are not in the sales schema and "
+            f"are not included."
+        ),
+        # Projections
+        "projections": projections,
+        "chart_series": chart_series,
+        # Meta
+        "daily_avg_net_cash": round(daily_avg_net, 2),
+        "trend_direction": trend_direction,
+        "trend_slope_per_day": round(float(slope), 2),
+        "trailing_days": trailing_days_actual,
+        "confidence": confidence,
+        # Recommendations
+        "recommendations": recommendations,
+    }
+
+
 if __name__ == "__main__":
     import json
     insights = get_all_insights(user_id=1)

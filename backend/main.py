@@ -37,6 +37,7 @@ from analysis_engine import (
     send_daily_whatsapp,
     calculate_root_causes,
     generate_action_plan,
+    predict_cash_flow,
 )
 from pdf_report import build_pdf_report
 
@@ -342,6 +343,40 @@ class ActionPlanResponse(BaseModel):
     pending: List[ActionTask]
     completed: List[ActionTask]
     total_potential_savings: float
+
+# ── Cash Flow Predictor models ────────────────────────────────────────────────
+
+class CashFlowProjection(BaseModel):
+    day: int
+    label: str
+    projected_cash: float
+    risk_level: str
+
+class CashFlowChartPoint(BaseModel):
+    day: int
+    label: str
+    projected_cash: float
+
+class CashFlowRecommendation(BaseModel):
+    title: str
+    explanation: str
+    financial_impact: float
+    impact_basis: str
+
+class CashFlowResponse(BaseModel):
+    insufficient_data: bool = False
+    data_sufficiency_note: str | None = None
+    current_cash_position: float | None = None
+    is_estimate: bool = True
+    position_basis: str | None = None
+    projections: List[CashFlowProjection]
+    chart_series: List[CashFlowChartPoint] = []
+    daily_avg_net_cash: float | None = None
+    trend_direction: str | None = None
+    trend_slope_per_day: float | None = None
+    trailing_days: int | None = None
+    confidence: float | None = None
+    recommendations: List[CashFlowRecommendation]
 
 class AdvisorPanelResponse(BaseModel):
     finance_take: str
@@ -1245,6 +1280,34 @@ def reopen_action_task(
     except Exception:
         logger.exception(f"Failed to reopen task {task_id} for user {current_user.id}")
         raise HTTPException(status_code=500, detail="Failed to reopen task.")
+
+
+# ── Cash Flow Predictor endpoint ──────────────────────────────────────────────
+
+@app.get("/api/cash-flow-prediction", response_model=CashFlowResponse)
+def get_cash_flow_prediction(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
+    """
+    Returns the AI Cash Flow Predictor result for the current user.
+
+    Projects cash position at +7, +15, +30 days using a linear trend fit
+    on trailing daily net cash (revenue - cost of goods). current_cash_position
+    is always a cash-basis estimate derived from sales data — not a bank balance.
+    See `position_basis` field for the exact derivation.
+    """
+    try:
+        result = predict_cash_flow(current_user.id, current_user.supabase)
+        return to_native(result)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="Business data files not found. Upload your data before generating a cash flow prediction."
+        )
+    except Exception:
+        logger.exception("Unexpected error generating cash flow prediction")
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong generating the cash flow prediction. Check server logs."
+        )
 
 
 @app.post("/api/user/update-phone")

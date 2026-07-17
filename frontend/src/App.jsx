@@ -34,6 +34,10 @@ function App() {
   const [actionPlanLoading, setActionPlanLoading] = useState(true)
   const [actionPlanError, setActionPlanError] = useState(null)
 
+  const [cashFlow, setCashFlow] = useState(null)
+  const [cashFlowLoading, setCashFlowLoading] = useState(true)
+  const [cashFlowError, setCashFlowError] = useState(null)
+
   const [question, setQuestion] = useState('')
   const [chatHistory, setChatHistory] = useState([])
   const [asking, setAsking] = useState(false)
@@ -140,6 +144,17 @@ function App() {
       setActionPlanError('Action plan unavailable — check backend logs.')
     } finally {
       setActionPlanLoading(false)
+    }
+
+    setCashFlowLoading(true)
+    try {
+      const cashFlowRes = await axios.get(`${API_BASE_URL}/api/cash-flow-prediction`)
+      setCashFlow(cashFlowRes.data)
+      setCashFlowError(null)
+    } catch (err) {
+      setCashFlowError('Cash flow prediction unavailable — check backend logs.')
+    } finally {
+      setCashFlowLoading(false)
     }
   }
 
@@ -481,6 +496,9 @@ function App() {
                     actionPlanLoading={actionPlanLoading}
                     actionPlanError={actionPlanError}
                     onActionPlanChange={setActionPlan}
+                    cashFlow={cashFlow}
+                    cashFlowLoading={cashFlowLoading}
+                    cashFlowError={cashFlowError}
                   />
                 ) : (
                   <Navigate to="/onboarding" replace />

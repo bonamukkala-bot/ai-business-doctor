@@ -1,7 +1,8 @@
 import { useMemo, useRef, useState } from 'react'
-import { ArrowUpRight, ArrowDownRight, TrendingUp, ShieldCheck, AlertTriangle, Package, Share2, MessageCircle, Globe, CheckCircle2, Circle, ChevronDown, ChevronUp, Clock, Zap } from 'lucide-react'
+import { ArrowUpRight, ArrowDownRight, TrendingUp, ShieldCheck, AlertTriangle, Package, Share2, MessageCircle, Globe, CheckCircle2, Circle, ChevronDown, ChevronUp, Clock, Zap, TrendingDown, Info } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import html2canvas from 'html2canvas'
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer } from 'recharts'
 import HealthGauge from '../components/HealthGauge.jsx'
 import Skeleton from '../components/Skeleton.jsx'
 import { API_BASE_URL } from '../config'
@@ -33,7 +34,7 @@ function buildSparklinePath(points, width = 100, height = 28) {
     .join(' ')
 }
 
-export default function DashboardPage({ user, insights, execSummary, execLoading, execError, healthScore, healthLabel, healthReasons, isProfitDown, rootCauseAnalysis, rootCauseLoading, rootCauseError, actionPlan, actionPlanLoading, actionPlanError, onActionPlanChange }) {
+export default function DashboardPage({ user, insights, execSummary, execLoading, execError, healthScore, healthLabel, healthReasons, isProfitDown, rootCauseAnalysis, rootCauseLoading, rootCauseError, actionPlan, actionPlanLoading, actionPlanError, onActionPlanChange, cashFlow, cashFlowLoading, cashFlowError }) {
   const shopName = user?.user_metadata?.shop_name || user?.email?.split('@')[0] || 'Business Doctor'
   const greeting = useMemo(() => `${getGreeting()}, ${shopName}`, [shopName])
   const boardSummaryRef = useRef(null)
@@ -617,6 +618,148 @@ export default function DashboardPage({ user, insights, execSummary, execLoading
                         ))}
                       </div>
                     )}
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+
+          {/* ── Cash Flow Predictor ───────────────────────────────────── */}
+          <section className="cash-flow-card card-interactive">
+            <div className="section-head section-head-row">
+              <div>
+                <span className="section-eyebrow">Predictor</span>
+                <h2 className="section-title">Cash Flow Forecast</h2>
+              </div>
+              {!cashFlowLoading && !cashFlowError && !cashFlow?.insufficient_data && cashFlow?.confidence != null && (
+                <span className="confidence-tag">
+                  {Math.round(cashFlow.confidence * 100)}% confidence
+                </span>
+              )}
+            </div>
+
+            {cashFlowLoading ? (
+              <div className="root-cause-loading">
+                <Skeleton lines={5} />
+                <p className="loading-text">Projecting cash flow…</p>
+              </div>
+            ) : cashFlowError ? (
+              <p className="root-cause-error">{cashFlowError}</p>
+            ) : cashFlow?.insufficient_data ? (
+              <div className="root-cause-insufficient">
+                <div className="empty-state-icon">💰</div>
+                <h3 className="empty-state-title">Need More Data</h3>
+                <p className="empty-state-description">{cashFlow.data_sufficiency_note}</p>
+              </div>
+            ) : (
+              <>
+                {/* Current position + estimate disclaimer */}
+                <div className="cf-position-row">
+                  <div className="cf-position-block">
+                    <span className="metric-label">
+                      Current Cash Position
+                      {cashFlow.is_estimate && <span className="cf-estimate-badge">estimate</span>}
+                    </span>
+                    <span className={`cf-position-value ${cashFlow.current_cash_position >= 0 ? 'positive' : 'negative'}`}>
+                      {formatCurrency(cashFlow.current_cash_position)}
+                    </span>
+                    <span className="cf-daily-avg">
+                      Avg {formatCurrency(cashFlow.daily_avg_net_cash)}/day · {cashFlow.trend_direction} trend
+                    </span>
+                  </div>
+                  <div className="cf-projection-badges">
+                    {cashFlow.projections?.map((p) => (
+                      <div key={p.day} className="cf-projection-badge">
+                        <span className="cf-proj-label">{p.label}</span>
+                        <span className={`cf-proj-value ${p.projected_cash >= 0 ? 'positive' : 'negative'}`}>
+                          {formatCurrency(p.projected_cash)}
+                        </span>
+                        <span className={`severity-tag severity-${p.risk_level === 'Healthy' ? 'low' : p.risk_level === 'Medium Risk' ? 'medium' : 'critical'}`}>
+                          {p.risk_level}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Estimate disclaimer */}
+                {cashFlow.is_estimate && cashFlow.position_basis && (
+                  <div className="cf-disclaimer">
+                    <Info size={12} />
+                    <span>{cashFlow.position_basis}</span>
+                  </div>
+                )}
+
+                {/* Chart: area chart of 30-day projected cash */}
+                {cashFlow.chart_series?.length > 1 && (
+                  <div className="cf-chart-wrap">
+                    <ResponsiveContainer width="100%" height={200}>
+                      <AreaChart
+                        data={cashFlow.chart_series}
+                        margin={{ top: 8, right: 4, left: 0, bottom: 0 }}
+                      >
+                        <defs>
+                          <linearGradient id="cf-gradient-pos" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="rgba(61,171,168,0.35)" />
+                            <stop offset="100%" stopColor="rgba(61,171,168,0.02)" />
+                          </linearGradient>
+                          <linearGradient id="cf-gradient-neg" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="rgba(212,101,90,0.25)" />
+                            <stop offset="100%" stopColor="rgba(212,101,90,0.02)" />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" vertical={false} />
+                        <XAxis
+                          dataKey="label"
+                          tick={{ fill: 'var(--text-muted)', fontSize: 10 }}
+                          interval={4}
+                          axisLine={false}
+                          tickLine={false}
+                        />
+                        <YAxis
+                          tick={{ fill: 'var(--text-muted)', fontSize: 10 }}
+                          axisLine={false}
+                          tickLine={false}
+                          tickFormatter={(v) => `₹${(v / 1000).toFixed(0)}k`}
+                          width={46}
+                        />
+                        <Tooltip
+                          contentStyle={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: '8px', fontSize: '12px' }}
+                          labelStyle={{ color: 'var(--text-muted)' }}
+                          formatter={(value) => [formatCurrency(value), 'Projected Cash']}
+                        />
+                        <ReferenceLine y={0} stroke="var(--border)" strokeDasharray="4 3" />
+                        <Area
+                          type="monotone"
+                          dataKey="projected_cash"
+                          stroke="var(--accent)"
+                          strokeWidth={2}
+                          fill={cashFlow.current_cash_position >= 0 ? 'url(#cf-gradient-pos)' : 'url(#cf-gradient-neg)'}
+                          dot={false}
+                          activeDot={{ r: 4, fill: 'var(--accent)' }}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                    <p className="chart-meta">Projected cumulative cash position over next 30 days · linear trend extrapolation from {cashFlow.trailing_days}-day window</p>
+                  </div>
+                )}
+
+                {/* Recommendations */}
+                {cashFlow.recommendations?.length > 0 && (
+                  <div className="cf-recommendations">
+                    <h3 className="cf-rec-heading">Recommendations</h3>
+                    <div className="cf-rec-list">
+                      {cashFlow.recommendations.map((rec, i) => (
+                        <div key={i} className="cf-rec-item">
+                          <div className="cf-rec-header">
+                            <h4 className="cf-rec-title">{rec.title}</h4>
+                            <span className="cf-rec-impact">{formatCurrency(rec.financial_impact)}</span>
+                          </div>
+                          <p className="cf-rec-explanation">{rec.explanation}</p>
+                          <span className="cf-rec-basis">{rec.impact_basis}</span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
               </>
