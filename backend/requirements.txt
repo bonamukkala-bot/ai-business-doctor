@@ -6,3 +6,9 @@ python-dotenv
 requests
 reportlab
 openpyxl
+sqlalchemy
+passlib[bcrypt]
+bcrypt==4.0.1
+python-jose[cryptography]
+twilio
+APScheduler

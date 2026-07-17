@@ -9,7 +9,11 @@ backend/.env
 # Node
 frontend/node_modules/
 frontend/dist/
+frontend/.env
 
 # Editor/OS
 .vscode/
 .DS_Store
+backend/user_data/
+
+backend/database.db

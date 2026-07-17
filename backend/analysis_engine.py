@@ -2,11 +2,16 @@ import os
 import json
 import logging
 import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 import pandas as pd
 import numpy as np
 import requests
+from twilio.rest import Client
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,6 +21,21 @@ logger = logging.getLogger("ai_business_doctor")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+
+# Twilio config (reused from main.py)
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+twilio_client = None
+
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    try:
+        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        logger.info("Twilio client initialized in analysis_engine.py")
+    except Exception as e:
+        logger.error(f"Failed to initialize Twilio client in analysis_engine.py: {e}")
 
 
 def to_native(obj):
@@ -34,8 +54,44 @@ def to_native(obj):
         return obj
 
 
-def capture_daily_snapshot():
-    config_path = os.path.join(os.path.dirname(__file__), "data_source_config.json")
+def get_business_goal(authenticated_supabase_client) -> Optional[str]:
+    """
+    Helper function to fetch the current user's business goal from their profile.
+    Takes an authenticated Supabase client (per-request auth).
+    """
+    try:
+        response = authenticated_supabase_client.table('profiles').select('business_goal').single().execute()
+        return getattr(response.data, 'business_goal', None) if hasattr(response, 'data') else response.data.get('business_goal')
+    except Exception as e:
+        logger.error(f"Failed to fetch business goal: {e}")
+        return None
+
+
+def normalize_date_series(date_series: pd.Series) -> pd.Series:
+    """Normalize date values, including Excel serial dates from uploaded files."""
+    if date_series.dtype.kind in "biuf":
+        try:
+            normalized = pd.to_datetime(date_series, unit="D", origin="1899-12-30")
+            if normalized.notna().all():
+                return normalized
+        except Exception:
+            pass
+
+    parsed = pd.to_datetime(date_series, errors="coerce")
+    if parsed.isna().any():
+        numeric = pd.to_numeric(date_series, errors="coerce")
+        if numeric.notna().all() and numeric.between(30, 60000).all():
+            try:
+                parsed = pd.to_datetime(numeric, unit="D", origin="1899-12-30")
+            except Exception:
+                pass
+
+    return parsed
+
+
+def capture_daily_snapshot(user_id: int):
+    user_dir = os.path.join(os.path.dirname(__file__), "user_data", str(user_id))
+    config_path = os.path.join(user_dir, "data_source_config.json")
     if not os.path.exists(config_path):
         return
 
@@ -72,7 +128,7 @@ def capture_daily_snapshot():
             live_df["date"] = today_str
             live_df = live_df[["date", "product", "units_sold", "revenue", "profit"]]
 
-            acc_path = os.path.join(os.path.dirname(__file__), "accumulated_sales_data.csv")
+            acc_path = os.path.join(user_dir, "accumulated_sales_data.csv")
             if os.path.exists(acc_path) and os.path.getsize(acc_path) > 0:
                 try:
                     acc_df = pd.read_csv(acc_path)
@@ -93,16 +149,42 @@ def capture_daily_snapshot():
             with open(config_path, "w") as f:
                 json.dump(config, f, indent=2)
 
-            logger.info(f"Captured sales snapshot for {today_str} (mtime: {live_mtime})")
+            logger.info(f"Captured sales snapshot for user {user_id} on {today_str} (mtime: {live_mtime})")
         except Exception as e:
-            logger.error(f"Failed to capture daily snapshot: {e}")
+            logger.error(f"Failed to capture daily snapshot for user {user_id}: {e}")
 
 
-def load_data():
-    config_path = os.path.join(os.path.dirname(__file__), "data_source_config.json")
+def normalize_date_series(date_series: pd.Series) -> pd.Series:
+    """Normalize date values, including Excel serial dates from uploaded files."""
+    if date_series.dtype.kind in "biuf":
+        try:
+            normalized = pd.to_datetime(date_series, unit="D", origin="1899-12-30")
+            if normalized.notna().all():
+                return normalized
+        except Exception:
+            pass
+
+    parsed = pd.to_datetime(date_series, errors="coerce")
+    if parsed.isna().any():
+        numeric = pd.to_numeric(date_series, errors="coerce")
+        if numeric.notna().all() and numeric.between(30, 60000).all():
+            try:
+                parsed = pd.to_datetime(numeric, unit="D", origin="1899-12-30")
+            except Exception:
+                pass
+
+    return parsed
+
+
+def load_data(user_id: int):
+    user_dir = os.path.join(os.path.dirname(__file__), "user_data", str(user_id))
+    config_path = os.path.join(user_dir, "data_source_config.json")
+    
+    # Default user-scoped paths
+    sales_path = os.path.join(user_dir, "sales_data.csv")
+    inventory_path = os.path.join(user_dir, "inventory_data.csv")
+    
     mode = "demo"
-    sales_path = "demo_sales_data.csv"
-    inventory_path = "demo_inventory_data.csv"
     
     if os.path.exists(config_path):
         try:
@@ -110,26 +192,32 @@ def load_data():
                 config = json.load(f)
                 mode = config.get("mode", "demo")
                 if mode == "uploaded":
-                    sales_path = config.get("sales_path") or "sales_data.csv"
-                    inventory_path = config.get("inventory_path") or "inventory_data.csv"
+                    sales_path = config.get("sales_path") or os.path.join(user_dir, "sales_data.csv")
+                    inventory_path = config.get("inventory_path") or os.path.join(user_dir, "inventory_data.csv")
                 elif mode == "live":
                     # Pre-create empty accumulated file if it doesn't exist
-                    acc_path = os.path.join(os.path.dirname(__file__), "accumulated_sales_data.csv")
+                    acc_path = os.path.join(user_dir, "accumulated_sales_data.csv")
                     if not os.path.exists(acc_path):
                         df = pd.DataFrame(columns=["date", "product", "units_sold", "revenue", "profit"])
                         df.to_csv(acc_path, index=False)
 
-                    capture_daily_snapshot()
+                    capture_daily_snapshot(user_id)
                     sales_path = acc_path
                     inventory_path = config.get("inventory_path")
         except Exception as e:
-            logger.error(f"Failed to read data_source_config.json: {e}")
+            logger.error(f"Failed to read data_source_config.json for user {user_id}: {e}")
 
     # Fallbacks if path is empty or file doesn't exist
     if not sales_path or not os.path.exists(sales_path):
-        sales_path = "demo_sales_data.csv"
+        sales_path = os.path.join(user_dir, "sales_data.csv")
     if not inventory_path or not os.path.exists(inventory_path):
-        inventory_path = "demo_inventory_data.csv"
+        inventory_path = os.path.join(user_dir, "inventory_data.csv")
+
+    # If those STILL don't exist, fall back to global demo
+    if not os.path.exists(sales_path):
+        sales_path = os.path.join(os.path.dirname(__file__), "demo_sales_data.csv")
+    if not os.path.exists(inventory_path):
+        inventory_path = os.path.join(os.path.dirname(__file__), "demo_inventory_data.csv")
 
     def read_file(path: str) -> pd.DataFrame:
         if path.lower().endswith(('.xlsx', '.xls')):
@@ -139,7 +227,7 @@ def load_data():
 
     sales = read_file(sales_path)
     inventory = read_file(inventory_path)
-    sales["date"] = pd.to_datetime(sales["date"])
+    sales["date"] = normalize_date_series(sales["date"])
     return sales, inventory
 
 
@@ -613,6 +701,7 @@ def _extract_top_opportunity(anomalies: list) -> str:
 
 def _call_groq_narrative(system_prompt: str, user_prompt: str = "Open the meeting.", max_tokens: int = 350) -> str | None:
     if not GROQ_API_KEY:
+        logger.warning("GROQ_API_KEY is not set")
         return None
     try:
         response = requests.post(
@@ -632,23 +721,41 @@ def _call_groq_narrative(system_prompt: str, user_prompt: str = "Open the meetin
             },
             timeout=15,
         )
+        logger.info(f"Groq API response status code: {response.status_code}")
+        logger.info(f"Groq API response headers: {dict(response.headers)}")
+        logger.info(f"Groq API response text: {response.text}")
         response.raise_for_status()
         data = response.json()
         return data["choices"][0]["message"]["content"].strip()
-    except (requests.exceptions.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
-        logger.error(f"Groq API call failed: {e}")
+    except requests.exceptions.RequestException as e:
+        logger.exception(f"Groq API request failed (exception type: {type(e).__name__}): {e}")
+        return None
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        logger.exception(f"Groq API response parsing failed (exception type: {type(e).__name__}): {e}")
         return None
 
 
-def get_executive_summary(sales: pd.DataFrame, inventory: pd.DataFrame) -> dict:
+def get_executive_summary(sales: pd.DataFrame, inventory: pd.DataFrame, mode: str | None = None) -> dict:
     """
     Board-meeting opening narrative combining health score, priority actions,
     anomaly alerts, and a 15-day profit forecast. Returns structured fields
     plus an LLM-written narrative with deterministic fallback.
     """
-    if sales.empty or sales["date"].dt.date.nunique() < 15:
+    insufficient_history = sales.empty or sales["date"].dt.date.nunique() < 15
+    if insufficient_history:
+        if mode == "live":
+            narrative = (
+                "Good afternoon. We are currently in learning mode. AI Business Doctor is building a history from your daily updates. "
+                "Please continue updating your sales data. Once 15 days of history are accumulated, we will generate your board narrative and forecast."
+            )
+        else:
+            narrative = (
+                "Good afternoon. We have less than 15 days of historical data available, so the board narrative and forecast are not yet ready. "
+                "Please upload a larger dataset or add more sales history to unlock the full diagnostic report."
+            )
+
         return {
-            "narrative": "Good afternoon. We are currently in learning mode. AI Business Doctor is building a history from your daily updates. Please continue updating your sales data. Once 15 days of history are accumulated, we will generate your board narrative and forecast.",
+            "narrative": narrative,
             "health_score": 100.0,
             "health_label": "Pending",
             "profit_forecast_next_15_days": 0.0,
@@ -735,12 +842,12 @@ def generate_executive_summary(sales: pd.DataFrame, inventory: pd.DataFrame) -> 
     }
 
 
-def simulate_scenario(product: str, demand_change_pct: float) -> dict:
+def simulate_scenario(product: str, demand_change_pct: float, user_id: int) -> dict:
     """
     Re-runs reorder and profit projections assuming a product's daily demand
     shifts by the given percentage.
     """
-    sales, inventory = load_data()
+    sales, inventory = load_data(user_id)
 
     inv_row = inventory[inventory["product"] == product]
     if inv_row.empty:
@@ -978,7 +1085,7 @@ def call_groq_llm(question: str, sales: pd.DataFrame, inventory: pd.DataFrame, h
         return None
 
 
-def ask_question(question: str, history: list | None = None):
+def ask_question(question: str, history: list | None = None, user_id: int = None):
     """
     Hybrid intent router:
     1. Fast-path: keyword matching for core, high-frequency questions
@@ -993,7 +1100,7 @@ def ask_question(question: str, history: list | None = None):
        clear canned message instead of crashing.
     """
     q = question.lower()
-    sales, inventory = load_data()
+    sales, inventory = load_data(user_id)
 
     if any(word in q for word in ["profit", "why", "decline", "down", "loss", "margin"]):
         analysis = analyze_profit_drop(sales)
@@ -1088,8 +1195,345 @@ def ask_question(question: str, history: list | None = None):
     }
 
 
-def get_all_insights():
-    sales, inventory = load_data()
+# --- AI Root Cause Engine ---
+
+# Threshold constants (not magic numbers!)
+SALES_DROP_THRESHOLD_PCT = 20.0  # 20% or more drop = anomaly
+MARGIN_DROP_THRESHOLD_PCT = 15.0  # 15% or more drop = anomaly
+CRITICAL_IMPACT_THRESHOLD = 5000.0  # Rs 5000+ = Critical
+HIGH_IMPACT_THRESHOLD = 2000.0  # Rs 2000+ = High
+MEDIUM_IMPACT_THRESHOLD = 500.0  # Rs 500+ = Medium
+MIN_DATA_DAYS = 30  # Need at least 30 days of data
+
+
+def calculate_root_causes(user_id: int, authenticated_supabase_client) -> dict:
+    """
+    Calculates root causes of business performance issues with:
+    - Deterministic anomaly detection
+    - Financial impact calculations
+    - Severity ranking
+    - Confidence scores (based on data availability)
+    - Template-based recommendations with LLM fallback
+    """
+    # Load data
+    sales, inventory = load_data(user_id)
+    causes = []
+    data_sufficiency_note = ""
+    period_compared = {}
+
+    # Step 1: Check data sufficiency
+    if sales.empty or sales["date"].dt.date.nunique() < MIN_DATA_DAYS:
+        data_sufficiency_note = (
+            f"Need at least {MIN_DATA_DAYS} days of sales history for full root cause analysis. "
+            f"Currently have {sales['date'].dt.date.nunique()} days of data."
+        )
+        return {
+            "period_compared": period_compared,
+            "causes": causes,
+            "data_sufficiency_note": data_sufficiency_note,
+            "insufficient_data": True
+        }
+
+    # Step 2: Split into current month and previous month
+    max_date = sales["date"].max()
+    current_month = max_date.replace(day=1)
+    previous_month = (current_month - pd.Timedelta(days=1)).replace(day=1)
+
+    current_month_sales = sales[sales["date"].dt.to_period("M") == current_month.to_period("M")]
+    previous_month_sales = sales[sales["date"].dt.to_period("M") == previous_month.to_period("M")]
+
+    period_compared = {
+        "current_month_start": current_month.isoformat(),
+        "previous_month_start": previous_month.isoformat(),
+        "current_month_days": current_month_sales["date"].dt.date.nunique(),
+        "previous_month_days": previous_month_sales["date"].dt.date.nunique()
+    }
+
+    # Calculate confidence: based on data availability
+    min_days = min(period_compared["current_month_days"], period_compared["previous_month_days"])
+    confidence_base = min(1.0, min_days / 15.0)  # Full confidence at 15 days per month
+
+    # Step 3: Analyze per product
+    if not current_month_sales.empty and not previous_month_sales.empty:
+        # Aggregate by product
+        current_agg = current_month_sales.groupby("product").agg(
+            total_units=("units_sold", "sum"),
+            total_revenue=("revenue", "sum"),
+            total_profit=("profit", "sum")
+        ).reset_index()
+
+        previous_agg = previous_month_sales.groupby("product").agg(
+            total_units=("units_sold", "sum"),
+            total_revenue=("revenue", "sum"),
+            total_profit=("profit", "sum")
+        ).reset_index()
+
+        merged = current_agg.merge(previous_agg, on="product", suffixes=("_current", "_previous"), how="outer").fillna(0)
+
+        # Calculate deltas
+        merged["sales_delta_pct"] = np.where(
+            merged["total_units_previous"] > 0,
+            (merged["total_units_current"] - merged["total_units_previous"]) / merged["total_units_previous"] * 100,
+            0
+        )
+
+        merged["current_margin_pct"] = np.where(
+            merged["total_revenue_current"] > 0,
+            (merged["total_profit_current"] / merged["total_revenue_current"] * 100),
+            0
+        )
+
+        merged["previous_margin_pct"] = np.where(
+            merged["total_revenue_previous"] > 0,
+            (merged["total_profit_previous"] / merged["total_revenue_previous"] * 100),
+            0
+        )
+
+        merged["margin_delta_pct"] = merged["current_margin_pct"] - merged["previous_margin_pct"]
+
+        # Check for anomalies
+        for _, row in merged.iterrows():
+            product = row["product"]
+            # 1. Sales drop anomaly
+            if row["sales_delta_pct"] <= -SALES_DROP_THRESHOLD_PCT and row["total_units_previous"] > 0:
+                financial_impact = row["total_profit_previous"] - row["total_profit_current"]
+                if financial_impact > 0:
+                    causes.append(_create_root_cause(
+                        title=f"Sales Drop for {product}",
+                        explanation=(
+                            f"Sales of {product} dropped by {abs(row['sales_delta_pct']):.1f}% this month compared to last month, "
+                            f"from {int(row['total_units_previous'])} units to {int(row['total_units_current'])} units."
+                        ),
+                        financial_impact=financial_impact,
+                        recommended_action=f"Investigate why {product} sales dropped—check pricing, competition, or stock availability.",
+                        expected_recovery=financial_impact * 0.8,  # 80% recovery expected if fixed
+                        confidence=confidence_base,
+                        product=product,
+                        cause_type="sales_drop"
+                    ))
+
+            # 2. Margin drop anomaly
+            if row["margin_delta_pct"] <= -MARGIN_DROP_THRESHOLD_PCT and row["total_units_current"] > 0:
+                financial_impact = row["total_units_current"] * (row["previous_margin_pct"] - row["current_margin_pct"]) / 100
+                if financial_impact > 0:
+                    causes.append(_create_root_cause(
+                        title=f"Margin Drop for {product}",
+                        explanation=(
+                            f"Margin for {product} dropped by {abs(row['margin_delta_pct']):.1f} percentage points this month."
+                        ),
+                        financial_impact=financial_impact,
+                        recommended_action=f"Review {product}'s cost structure and pricing strategy.",
+                        expected_recovery=financial_impact * 0.9,  # 90% recovery expected
+                        confidence=confidence_base,
+                        product=product,
+                        cause_type="margin_drop"
+                    ))
+
+    # Step 4: Check for stockout days (using inventory and recent sales)
+    if not inventory.empty and not current_month_sales.empty:
+        recent_sales = current_month_sales[current_month_sales["date"] >= (max_date - pd.Timedelta(days=14))]
+        recent_demand = recent_sales.groupby("product")["units_sold"].sum().reset_index()
+        recent_demand["daily_avg"] = recent_demand["units_sold"] / 14
+        inventory_with_demand = inventory.merge(recent_demand, on="product", how="left").fillna(0)
+
+        for _, row in inventory_with_demand.iterrows():
+            product = row["product"]
+            daily_avg = row["daily_avg"]
+            current_stock = row["current_stock"]
+            if daily_avg > 0:
+                days_of_stock = current_stock / daily_avg
+                if days_of_stock <= 3:
+                    profit_per_unit = 0
+                    product_sales = current_month_sales[current_month_sales["product"] == product]
+                    if not product_sales.empty:
+                        total_units = product_sales["units_sold"].sum()
+                        if total_units > 0:
+                            profit_per_unit = product_sales["profit"].sum() / total_units
+                    financial_impact = daily_avg * profit_per_unit * 7  # 7 days of lost profit
+                    if financial_impact > 0:
+                        causes.append(_create_root_cause(
+                            title=f"Critical Stockout Risk for {product}",
+                            explanation=(
+                                f"{product} has only {days_of_stock:.1f} days of stock left at current demand levels."
+                            ),
+                            financial_impact=financial_impact,
+                            recommended_action=f"Reorder {product} immediately—at least {int(daily_avg * 7)} units for 7 days coverage.",
+                            expected_recovery=financial_impact,
+                            confidence=confidence_base,
+                            product=product,
+                            cause_type="stockout_risk"
+                        ))
+
+    # Step 5: Rank causes by financial impact descending
+    causes.sort(key=lambda x: x["financial_impact"], reverse=True)
+
+    return {
+        "period_compared": period_compared,
+        "causes": causes,
+        "data_sufficiency_note": data_sufficiency_note if data_sufficiency_note else None,
+        "insufficient_data": False
+    }
+
+
+def _create_root_cause(title: str, explanation: str, financial_impact: float, recommended_action: str, expected_recovery: float, confidence: float, product: str, cause_type: str) -> dict:
+    """Helper to create root cause object with severity and template-based recommendation"""
+    # Calculate severity based on financial impact
+    if financial_impact >= CRITICAL_IMPACT_THRESHOLD:
+        severity = "Critical"
+    elif financial_impact >= HIGH_IMPACT_THRESHOLD:
+        severity = "High"
+    elif financial_impact >= MEDIUM_IMPACT_THRESHOLD:
+        severity = "Medium"
+    else:
+        severity = "Low"
+
+    # Template-based recommendation is already passed in, try to enhance with LLM
+    # But for now, use template (we can add LLM enhancement later if needed)
+    return {
+        "title": title,
+        "explanation": explanation,
+        "financial_impact": round(financial_impact, 2),
+        "severity": severity,
+        "confidence": round(confidence, 2),
+        "recommended_action": recommended_action,
+        "expected_recovery": round(expected_recovery, 2),
+        "product": product,
+        "cause_type": cause_type
+    }
+
+
+def get_daily_summary(sales: pd.DataFrame, inventory: pd.DataFrame, test_date: datetime.date | None = None) -> dict:
+    """
+    Returns daily business summary:
+    - today's total profit/loss
+    - list of top-selling items today
+    - placeholder for restocked items (since no restock history exists yet)
+    """
+    today = test_date or datetime.date.today()
+    # Filter sales for today
+    today_sales = sales[sales["date"].dt.date == today].copy()
+    
+    # Total profit today
+    total_profit_today = round(float(today_sales["profit"].sum()), 2)
+    
+    # Top-selling items: group by product, sum units and revenue
+    if not today_sales.empty:
+        top_sellers = (
+            today_sales
+            .groupby("product")
+            .agg(units_sold=("units_sold", "sum"), revenue=("revenue", "sum"))
+            .reset_index()
+            .sort_values("units_sold", ascending=False)
+        )
+        top_sellers_list = [
+            {
+                "product": row["product"],
+                "units_sold": int(row["units_sold"]),
+                "revenue": round(float(row["revenue"]), 2)
+            }
+            for _, row in top_sellers.iterrows()
+        ]
+    else:
+        top_sellers_list = []
+    
+    # No restock history available yet, so return empty list
+    restocked_today = []
+    
+    return {
+        "date": today.isoformat(),
+        "total_profit_today": total_profit_today,
+        "top_selling_items": top_sellers_list,
+        "restocked_items_today": restocked_today
+    }
+
+
+def send_daily_email(summary: dict, recipient_email: str) -> None:
+    """
+    Sends daily summary email via Gmail SMTP
+    """
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        logger.warning("GMAIL_ADDRESS or GMAIL_APP_PASSWORD not set — skipping email")
+        return
+    
+    subject = f"Daily Business Report - {summary['date']}"
+    
+    # Build body
+    body = f"Daily Business Report for {summary['date']}\n"
+    body += "=======================================\n\n"
+    body += f"Total Profit Today: Rs {summary['total_profit_today']:,.2f}\n\n"
+    
+    if summary['top_selling_items']:
+        body += "Top Selling Items:\n"
+        body += "-------------------\n"
+        for item in summary['top_selling_items'][:5]:  # Top 5
+            body += f"- {item['product']}: {item['units_sold']} units sold, Rs {item['revenue']:,.2f}\n"
+        body += "\n"
+    
+    if summary['restocked_items_today']:
+        body += "Items Restocked Today:\n"
+        body += "-----------------------\n"
+        for item in summary['restocked_items_today']:
+            body += f"- {item['product']}: {item['qty']} units\n"
+    else:
+        body += "No items restocked today.\n\n"
+    
+    # Create message
+    msg = MIMEMultipart()
+    msg['From'] = GMAIL_ADDRESS
+    msg['To'] = recipient_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+    
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            text = msg.as_string()
+            server.sendmail(GMAIL_ADDRESS, recipient_email, text)
+        logger.info(f"Successfully sent daily report email to {recipient_email}")
+    except Exception as e:
+        logger.exception(f"Failed to send daily report email: {e}")
+
+
+def send_daily_whatsapp(summary: dict, recipient_phone: str) -> None:
+    """
+    Sends daily summary via WhatsApp using Twilio
+    """
+    if not twilio_client or not TWILIO_WHATSAPP_NUMBER:
+        logger.warning("Twilio not configured — skipping WhatsApp message")
+        return
+    
+    # Build message body
+    body = f"📊 Daily Business Report - {summary['date']}\n"
+    body += "--------------------------------\n"
+    body += f"Total Profit Today: Rs {summary['total_profit_today']:,.2f}\n\n"
+    
+    if summary['top_selling_items']:
+        body += "🏆 Top Selling Items:\n"
+        for i, item in enumerate(summary['top_selling_items'][:5], 1):
+            body += f"{i}. {item['product']}: {item['units_sold']} units, Rs {item['revenue']:,.2f}\n"
+        body += "\n"
+    
+    if summary['restocked_items_today']:
+        body += "📦 Restocked Items:\n"
+        for item in summary['restocked_items_today']:
+            body += f"- {item['product']}: {item['qty']} units\n"
+    else:
+        body += "📦 No items restocked today.\n"
+    
+    try:
+        message = twilio_client.messages.create(
+            from_=f"whatsapp:{TWILIO_WHATSAPP_NUMBER}",
+            body=body,
+            to=f"whatsapp:{recipient_phone}"
+        )
+        logger.info(f"Successfully sent daily WhatsApp report to {recipient_phone}: SID {message.sid}")
+    except Exception as e:
+        logger.exception(f"Failed to send daily WhatsApp report: {e}")
+
+
+def get_all_insights(user_id: int):
+    sales, inventory = load_data(user_id)
     insufficient_data = sales.empty or sales["date"].dt.date.nunique() < 15
     
     result = {
@@ -1111,5 +1555,5 @@ def get_all_insights():
 
 if __name__ == "__main__":
     import json
-    insights = get_all_insights()
+    insights = get_all_insights(user_id=1)
     print(json.dumps(insights, indent=2, default=str))

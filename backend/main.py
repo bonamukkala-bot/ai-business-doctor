@@ -6,13 +6,20 @@ import shutil
 import datetime
 from typing import List
 import pandas as pd
+import requests
+from twilio.rest import Client
+from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
 
-
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+import auth
+from supabase_client import supabase, supabase_client_initialized, supabase_init_error
 
 from analysis_engine import (
     get_all_insights,
@@ -22,11 +29,35 @@ from analysis_engine import (
     get_advisor_panel,
     simulate_scenario,
     load_data,
+    GROQ_API_KEY,
+    GROQ_URL,
+    GROQ_MODEL,
+    get_daily_summary,
+    send_daily_email,
+    send_daily_whatsapp,
+    calculate_root_causes,
 )
 from pdf_report import build_pdf_report
 
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai_business_doctor")
+
+# Twilio Configuration
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+twilio_client = None
+
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    try:
+        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        logger.info("Twilio client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Twilio client: {e}")
+else:
+    logger.warning("Twilio credentials not configured - WhatsApp features disabled")
 
 app = FastAPI(
     title="AI Business Doctor API",
@@ -46,6 +77,96 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if supabase_client_initialized:
+    logger.info("Supabase client initialized successfully.")
+else:
+    logger.error(f"Supabase client initialization failed: {supabase_init_error}")
+
+# Initialize scheduler
+scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Kolkata"))
+
+def run_daily_report():
+    """
+    Scheduled job to run daily at 10 PM IST:
+    Get daily summary and send email/WhatsApp to all users
+    """
+    logger.info("Running daily report job...")
+    try:
+        # Fetch all users from profiles table
+        if not supabase_client_initialized:
+            logger.error("Supabase not initialized — skipping daily report")
+            return
+        
+        response = supabase.table("profiles").select("id, email, phone_number").execute()
+        users = response.data
+        if not users:
+            logger.warning("No users found — skipping daily report")
+            return
+        
+        for user in users:
+            user_id = user["id"]
+            user_email = user.get("email")
+            user_phone = user.get("phone_number")
+            
+            logger.info(f"Processing daily report for user {user_id}")
+            
+            try:
+                sales, inventory = load_data(user_id)
+                summary = get_daily_summary(sales, inventory)
+                
+                # Send email if we have email
+                if user_email:
+                    send_daily_email(summary, user_email)
+                
+                # Send WhatsApp if we have phone number
+                if user_phone:
+                    send_daily_whatsapp(summary, user_phone)
+            
+            except Exception as e:
+                logger.exception(f"Failed to process daily report for user {user_id}: {e}")
+        
+        logger.info("Daily report job complete!")
+    
+    except Exception as e:
+        logger.exception(f"Daily report job failed: {e}")
+
+
+# ---------- FastAPI Startup/Shutdown Events ----------
+@app.on_event("startup")
+def start_scheduler():
+    # Add daily job at 10 PM IST (Asia/Kolkata)
+    scheduler.add_job(
+        run_daily_report,
+        trigger=CronTrigger(hour=22, minute=0, timezone=pytz.timezone("Asia/Kolkata")),
+        id="daily_report_job",
+        name="Daily Business Report",
+        replace_existing=True
+    )
+    scheduler.start()
+    logger.info("Scheduler started — daily report scheduled for 10 PM IST")
+
+
+@app.on_event("shutdown")
+def stop_scheduler():
+    scheduler.shutdown()
+    logger.info("Scheduler stopped")
+
+
+# ---------- Authentication Schemas ----------
+
+class CompleteProfileRequest(BaseModel):
+    shop_name: str
+    business_type: str | None = None
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    shop_name: str | None = None
+    business_type: str | None = None
+
+    class Config:
+        from_attributes = True
 
 
 # ---------- Response Schemas ----------
@@ -180,6 +301,23 @@ class SimulateResponse(BaseModel):
     recommended_action: str
 
 
+class RootCause(BaseModel):
+    title: str
+    explanation: str
+    financial_impact: float
+    severity: str
+    confidence: float
+    recommended_action: str
+    expected_recovery: float
+    product: str
+    cause_type: str
+
+class RootCauseAnalysisResponse(BaseModel):
+    period_compared: dict
+    causes: List[RootCause]
+    data_sufficiency_note: str | None = None
+    insufficient_data: bool = False
+
 class AdvisorPanelResponse(BaseModel):
     finance_take: str
     operations_take: str
@@ -203,12 +341,17 @@ class UploadSuccessResponse(BaseModel):
     summary: DataStatusResponse
 
 
-CONFIG_FILE = "data_source_config.json"
+def get_user_dir(user_id: int) -> str:
+    user_dir = os.path.join(os.path.dirname(__file__), "user_data", str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
 
-def get_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
+def get_config(user_id: int) -> dict:
+    user_dir = get_user_dir(user_id)
+    config_file = os.path.join(user_dir, "data_source_config.json")
+    if os.path.exists(config_file):
         try:
-            with open(CONFIG_FILE, "r") as f:
+            with open(config_file, "r") as f:
                 return json.load(f)
         except Exception:
             pass
@@ -220,12 +363,14 @@ def get_config() -> dict:
         "uploaded_inventory_path": None
     }
 
-def save_config(config: dict):
+def save_config(user_id: int, config: dict):
+    user_dir = get_user_dir(user_id)
+    config_file = os.path.join(user_dir, "data_source_config.json")
     try:
-        with open(CONFIG_FILE, "w") as f:
+        with open(config_file, "w") as f:
             json.dump(config, f, indent=2)
     except Exception as e:
-        logger.error(f"Failed to save config: {e}")
+        logger.error(f"Failed to save config for user {user_id}: {e}")
 
 def compute_summary(sales_df: pd.DataFrame, inventory_df: pd.DataFrame) -> dict:
     try:
@@ -338,34 +483,96 @@ MAX_HISTORY_PER_SESSION = 6
 
 # ---------- Routes ----------
 
+@app.post("/auth/complete-profile", response_model=UserResponse)
+def complete_profile(
+    request: CompleteProfileRequest,
+    current_user: auth.AuthenticatedSupabaseUser = Depends(auth.get_current_user),
+):
+    try:
+        current_user.supabase.table('profiles').upsert({
+            'id': current_user.id,
+            'shop_name': request.shop_name,
+            'business_type': request.business_type,
+        }).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Failed to save profile to Supabase: {exc}')
+
+    return {
+        'id': current_user.id,
+        'email': current_user.email,
+        'shop_name': request.shop_name,
+        'business_type': request.business_type,
+    }
+
+
+@app.get('/auth/me', response_model=UserResponse)
+def get_me(
+    current_user: auth.AuthenticatedSupabaseUser = Depends(auth.get_current_user),
+):
+    try:
+        result = current_user.supabase.table('profiles').select('shop_name,business_type').eq('id', current_user.id).maybe_single().execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Failed to fetch profile from Supabase: {exc}')
+
+    profile = result.data or {}
+    return {
+        'id': current_user.id,
+        'email': current_user.email,
+        'shop_name': profile.get('shop_name'),
+        'business_type': profile.get('business_type'),
+    }
+
+
 @app.get("/", response_model=HealthResponse)
 def root():
     """Basic health check to confirm the API is up."""
     return {"status": "ok", "service": "AI Business Doctor API"}
 
 
-@app.get("/data-status", response_model=DataStatusResponse)
-def data_status():
+@app.get("/supabase-health")
+def supabase_health():
+    """Verifies the Supabase client can connect and authenticate."""
+    if supabase is None:
+        return {"status": "disconnected", "detail": str(supabase_init_error) if supabase_init_error else "Supabase client not initialized."}
+
     try:
-        config = get_config()
+        response = supabase.table("_healthcheck").select("*").limit(1).execute()
+        return {"status": "connected", "detail": "ok"}
+    except Exception as exc:
+        return {"status": "connected", "detail": str(exc)}
+
+
+@app.get("/data-status", response_model=DataStatusResponse)
+def data_status(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
+    try:
+        user_dir = get_user_dir(current_user.id)
+        config = get_config(current_user.id)
         mode = config.get("mode", "demo")
-        sales_path = "demo_sales_data.csv"
-        inventory_path = "demo_inventory_data.csv"
+        
+        # Default user-scoped paths
+        sales_path = os.path.join(user_dir, "sales_data.csv")
+        inventory_path = os.path.join(user_dir, "inventory_data.csv")
         
         if mode == "uploaded":
-            sales_path = config.get("sales_path") or "sales_data.csv"
-            inventory_path = config.get("inventory_path") or "inventory_data.csv"
+            sales_path = config.get("sales_path") or os.path.join(user_dir, "sales_data.csv")
+            inventory_path = config.get("inventory_path") or os.path.join(user_dir, "inventory_data.csv")
         elif mode == "live":
             sales_path = config.get("sales_path")
             inventory_path = config.get("inventory_path")
 
         # Fallbacks if files don't exist
         if not sales_path or not os.path.exists(sales_path):
-            sales_path = "demo_sales_data.csv"
+            sales_path = os.path.join(user_dir, "sales_data.csv")
         if not inventory_path or not os.path.exists(inventory_path):
-            inventory_path = "demo_inventory_data.csv"
+            inventory_path = os.path.join(user_dir, "inventory_data.csv")
 
-        sales, inventory = load_data()
+        # If STILL don't exist, fall back to global demo
+        if not os.path.exists(sales_path):
+            sales_path = os.path.join(os.path.dirname(__file__), "demo_sales_data.csv")
+        if not os.path.exists(inventory_path):
+            inventory_path = os.path.join(os.path.dirname(__file__), "demo_inventory_data.csv")
+
+        sales, inventory = load_data(current_user.id)
         summary = compute_summary(sales, inventory)
 
         sales_mtime = os.path.getmtime(sales_path) if os.path.exists(sales_path) else 0
@@ -373,18 +580,10 @@ def data_status():
         max_mtime = max(sales_mtime, inventory_mtime)
         last_modified = datetime.datetime.fromtimestamp(max_mtime, datetime.timezone.utc).isoformat() if max_mtime > 0 else None
 
-        days_of_history_captured = None
-        if mode == "live":
-            acc_path = os.path.join(os.path.dirname(__file__), "accumulated_sales_data.csv")
-            if os.path.exists(acc_path):
-                try:
-                    df = pd.read_csv(acc_path)
-                    days_of_history_captured = int(df["date"].nunique())
-                except Exception as e:
-                    logger.error(f"Failed to read accumulated_sales_data.csv for data-status: {e}")
-                    days_of_history_captured = 0
-            else:
-                days_of_history_captured = 0
+        try:
+            days_of_history_captured = int(sales["date"].dt.date.nunique())
+        except Exception:
+            days_of_history_captured = 0
 
         return {
             "source": mode,
@@ -412,8 +611,10 @@ def data_status():
 @app.post("/upload-data", response_model=UploadSuccessResponse)
 async def upload_data(
     sales_file: UploadFile = File(...),
-    inventory_file: UploadFile = File(...)
+    inventory_file: UploadFile = File(...),
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user)
 ):
+    user_dir = get_user_dir(current_user.id)
     try:
         sales_content = await sales_file.read()
         sales_df = read_upload_file(sales_file, sales_content)
@@ -437,12 +638,12 @@ async def upload_data(
     sales_ext = ".xlsx" if sales_file.filename.lower().endswith(('.xlsx', '.xls')) else ".csv"
     inventory_ext = ".xlsx" if inventory_file.filename.lower().endswith(('.xlsx', '.xls')) else ".csv"
     
-    sales_path = f"sales_data{sales_ext}"
-    inventory_path = f"inventory_data{inventory_ext}"
+    sales_path = os.path.join(user_dir, f"sales_data{sales_ext}")
+    inventory_path = os.path.join(user_dir, f"inventory_data{inventory_ext}")
 
     for ext in [".csv", ".xlsx"]:
-        other_sales = f"sales_data{ext}"
-        other_inv = f"inventory_data{ext}"
+        other_sales = os.path.join(user_dir, f"sales_data{ext}")
+        other_inv = os.path.join(user_dir, f"inventory_data{ext}")
         if other_sales != sales_path and os.path.exists(other_sales):
             try:
                 os.remove(other_sales)
@@ -471,15 +672,15 @@ async def upload_data(
             detail=f"Failed to save uploaded files: {str(e)}"
         )
 
-    config = get_config()
+    config = get_config(current_user.id)
     config["mode"] = "uploaded"
     config["sales_path"] = sales_path
     config["inventory_path"] = inventory_path
     config["uploaded_sales_path"] = sales_path
     config["uploaded_inventory_path"] = inventory_path
-    save_config(config)
+    save_config(current_user.id, config)
 
-    sales, inventory = load_data()
+    sales, inventory = load_data(current_user.id)
     summary = compute_summary(sales, inventory)
 
     sales_mtime = os.path.getmtime(sales_path) if os.path.exists(sales_path) else 0
@@ -503,7 +704,8 @@ async def upload_data(
 
 
 @app.post("/reset-demo-data", response_model=UploadSuccessResponse)
-def reset_demo_data():
+def reset_demo_data(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
+    user_dir = get_user_dir(current_user.id)
     try:
         config = {
             "mode": "demo",
@@ -512,19 +714,26 @@ def reset_demo_data():
             "uploaded_sales_path": None,
             "uploaded_inventory_path": None
         }
-        for path in ["sales_data.csv", "sales_data.xlsx", "inventory_data.csv", "inventory_data.xlsx"]:
+        for filename in ["sales_data.csv", "sales_data.xlsx", "inventory_data.csv", "inventory_data.xlsx"]:
+            path = os.path.join(user_dir, filename)
             if os.path.exists(path):
                 try:
                     os.remove(path)
                 except Exception:
                     pass
 
-        save_config(config)
-        sales, inventory = load_data()
+        # Re-seed the demo files in the user's directory
+        demo_sales_src = os.path.join(os.path.dirname(__file__), "demo_sales_data.csv")
+        demo_inventory_src = os.path.join(os.path.dirname(__file__), "demo_inventory_data.csv")
+        shutil.copy(demo_sales_src, os.path.join(user_dir, "sales_data.csv"))
+        shutil.copy(demo_inventory_src, os.path.join(user_dir, "inventory_data.csv"))
+
+        save_config(current_user.id, config)
+        sales, inventory = load_data(current_user.id)
         summary = compute_summary(sales, inventory)
         
-        sales_path = "demo_sales_data.csv"
-        inventory_path = "demo_inventory_data.csv"
+        sales_path = os.path.join(user_dir, "sales_data.csv")
+        inventory_path = os.path.join(user_dir, "inventory_data.csv")
         sales_mtime = os.path.getmtime(sales_path) if os.path.exists(sales_path) else 0
         inventory_mtime = os.path.getmtime(inventory_path) if os.path.exists(inventory_path) else 0
         max_mtime = max(sales_mtime, inventory_mtime)
@@ -556,8 +765,98 @@ class ConnectLiveRequest(BaseModel):
     inventory_path: str
 
 
+@app.post("/onboarding/complete", response_model=UploadSuccessResponse)
+async def onboarding_complete(
+    business_type: str = Form(...),
+    shop_name: str = Form(...),
+    source: str = Form(...),
+    sales_file: UploadFile | None = File(None),
+    manual_rows: str | None = Form(None),
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user),
+):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail='Supabase client not initialized.')
+
+    user_dir = get_user_dir(current_user.id)
+    try:
+        config = get_config(current_user.id)
+
+        if source == 'upload':
+            if not sales_file:
+                raise HTTPException(status_code=400, detail='Sales file is required for upload source.')
+            sales_content = await sales_file.read()
+            sales_df = read_upload_file(sales_file, sales_content)
+            if not all(col in sales_df.columns for col in ['date', 'product', 'units_sold', 'revenue', 'profit']):
+                raise HTTPException(status_code=400, detail='Uploaded sales file must include date, product, units_sold, revenue, and profit columns.')
+            sales_path = os.path.join(user_dir, 'sales_data.csv')
+            sales_df.to_csv(sales_path, index=False)
+            config['mode'] = 'uploaded'
+            config['sales_path'] = sales_path
+            config['inventory_path'] = os.path.join(user_dir, 'inventory_data.csv')
+            save_config(current_user.id, config)
+        elif source == 'manual':
+            if not manual_rows:
+                raise HTTPException(status_code=400, detail='Manual rows are required for manual source.')
+            rows = json.loads(manual_rows)
+            if len(rows) < 5:
+                raise HTTPException(status_code=400, detail='At least 5 manual rows are required.')
+            sales_df = pd.DataFrame(rows)
+            if not all(col in sales_df.columns for col in ['date', 'product', 'units_sold', 'revenue', 'profit']):
+                raise HTTPException(status_code=400, detail='Manual rows must include date, product, units_sold, revenue, and profit.')
+            sales_path = os.path.join(user_dir, 'sales_data.csv')
+            sales_df.to_csv(sales_path, index=False)
+            config['mode'] = 'uploaded'
+            config['sales_path'] = sales_path
+            config['inventory_path'] = os.path.join(user_dir, 'inventory_data.csv')
+            save_config(current_user.id, config)
+        else:
+            config['mode'] = 'demo'
+            config['sales_path'] = None
+            config['inventory_path'] = None
+            save_config(current_user.id, config)
+
+        try:
+            current_user.supabase.table('profiles').select('*').eq('id', current_user.id).maybe_single().execute()
+            current_user.supabase.table('profiles').upsert({
+                'id': current_user.id,
+                'shop_name': shop_name,
+                'business_type': business_type,
+            }).execute()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f'Failed to save profile to Supabase: {exc}')
+
+        sales, inventory = load_data(current_user.id)
+        summary = compute_summary(sales, inventory)
+        sales_path = config.get('sales_path')
+        inventory_path = config.get('inventory_path')
+        sales_mtime = os.path.getmtime(sales_path) if sales_path and os.path.exists(sales_path) else 0
+        inventory_mtime = os.path.getmtime(inventory_path) if inventory_path and os.path.exists(inventory_path) else 0
+        max_mtime = max(sales_mtime, inventory_mtime)
+        last_modified = datetime.datetime.fromtimestamp(max_mtime, datetime.timezone.utc).isoformat() if max_mtime > 0 else None
+
+        return {
+            'status': 'success',
+            'message': 'Onboarding complete. Your data is ready for diagnosis.',
+            'summary': {
+                'source': config['mode'],
+                'sales_path': sales_path,
+                'inventory_path': inventory_path,
+                'last_modified': last_modified,
+                'days': summary['days'],
+                'products': summary['products'],
+                'date_range': summary['date_range'],
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception('Failed to complete onboarding')
+        raise HTTPException(status_code=500, detail=f'Failed to complete onboarding: {str(e)}')
+
+
 @app.post("/connect-live-file", response_model=UploadSuccessResponse)
-def connect_live_file(request: ConnectLiveRequest):
+def connect_live_file(request: ConnectLiveRequest, current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
     sales_path = request.sales_path.strip()
     inventory_path = request.inventory_path.strip()
 
@@ -581,13 +880,13 @@ def connect_live_file(request: ConnectLiveRequest):
 
     validate_dfs(sales_df, inventory_df, source_label="Live Excel/CSV File")
 
-    config = get_config()
+    config = get_config(current_user.id)
     config["mode"] = "live"
     config["sales_path"] = sales_path
     config["inventory_path"] = inventory_path
-    save_config(config)
+    save_config(current_user.id, config)
 
-    sales, inventory = load_data()
+    sales, inventory = load_data(current_user.id)
     summary = compute_summary(sales, inventory)
 
     sales_mtime = os.path.getmtime(sales_path) if os.path.exists(sales_path) else 0
@@ -611,9 +910,10 @@ def connect_live_file(request: ConnectLiveRequest):
 
 
 @app.post("/disconnect-live-file", response_model=UploadSuccessResponse)
-def disconnect_live_file():
+def disconnect_live_file(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
     try:
-        config = get_config()
+        user_dir = get_user_dir(current_user.id)
+        config = get_config(current_user.id)
         uploaded_sales = config.get("uploaded_sales_path")
         uploaded_inventory = config.get("uploaded_inventory_path")
 
@@ -628,13 +928,19 @@ def disconnect_live_file():
             config["inventory_path"] = None
             message = "Disconnected live file. Restored default demo data."
 
-        save_config(config)
+        save_config(current_user.id, config)
 
-        sales, inventory = load_data()
+        sales, inventory = load_data(current_user.id)
         summary = compute_summary(sales, inventory)
 
-        active_sales = config.get("sales_path") or "demo_sales_data.csv"
-        active_inv = config.get("inventory_path") or "demo_inventory_data.csv"
+        active_sales = config.get("sales_path") or os.path.join(user_dir, "sales_data.csv")
+        active_inv = config.get("inventory_path") or os.path.join(user_dir, "inventory_data.csv")
+        
+        if not os.path.exists(active_sales):
+            active_sales = os.path.join(os.path.dirname(__file__), "demo_sales_data.csv")
+        if not os.path.exists(active_inv):
+            active_inv = os.path.join(os.path.dirname(__file__), "demo_inventory_data.csv")
+
         sales_mtime = os.path.getmtime(active_sales) if os.path.exists(active_sales) else 0
         inventory_mtime = os.path.getmtime(active_inv) if os.path.exists(active_inv) else 0
         max_mtime = max(sales_mtime, inventory_mtime)
@@ -661,10 +967,304 @@ def disconnect_live_file():
         )
 
 
+class UpdatePhoneRequest(BaseModel):
+    phone_number: str
+
+
+class UpdateBusinessGoalRequest(BaseModel):
+    business_goal: str
+
+
+class WhatsAppAlertRequest(BaseModel):
+    user_id: str
+
+
+class TranslationRequest(BaseModel):
+    narrative: str
+    language: str
+
+
+@app.post("/api/translate-narrative")
+def translate_narrative(request: TranslationRequest):
+    """
+    Translates the executive summary narrative to the specified language.
+    Currently supports English, Telugu, and Hindi.
+    """
+    try:
+        # For now, we'll use a simple translation approach
+        # In production, this would use a proper translation service
+        language_instructions = {
+            'telugu': 'Write this business summary in Telugu, using simple everyday language a small shop owner would use, not formal business jargon.',
+            'hindi': 'Write this business summary in Hindi, using simple everyday language a small shop owner would use, not formal business jargon.',
+            'english': 'Keep this business summary in English.'
+        }
+
+        if request.language not in language_instructions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported language: {request.language}. Supported languages: english, telugu, hindi"
+            )
+
+        # If English, return as-is
+        if request.language == 'english':
+            return {
+                "translated_narrative": request.narrative,
+                "language": "english"
+            }
+
+        # For other languages, we would call Groq with translation instructions
+        # For now, return placeholder (in production, this would call Groq)
+        system_prompt = f"You are a business translator. {language_instructions[request.language]} Keep all numbers and currency figures as digits - only translate the narrative prose."
+
+        try:
+            response = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": request.narrative},
+                    ],
+                    "temperature": 0.5,
+                    "max_tokens": 350,
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json()
+            translated = data["choices"][0]["message"]["content"].strip()
+
+            return {
+                "translated_narrative": translated,
+                "language": request.language
+            }
+        except Exception as e:
+            logger.error(f"Translation failed: {e}")
+            # Fallback to placeholder if translation fails
+            placeholders = {
+                'telugu': 'తెలుగు అనువాదం ఇక్కడ ఉంటుంది (Telugu translation would be here)',
+                'hindi': 'हिंदी अनुवाद यहां होगा (Hindi translation would be here)'
+            }
+            return {
+                "translated_narrative": placeholders.get(request.language, request.narrative),
+                "language": request.language
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Translation error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Translation failed: {str(e)}"
+        )
+
+
+class WhatsAppAlertRequest(BaseModel):
+    user_id: str
+
+
+@app.get("/api/business-goal")
+def get_business_goal_endpoint(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
+    """
+    Gets the current user's business goal from their profile.
+    """
+    try:
+        response = current_user.supabase.table('profiles').select('business_goal').single().execute()
+        return {
+            "business_goal": response.data.get('business_goal')
+        }
+    except Exception as e:
+        logger.exception(f"Failed to get business goal: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get business goal: {str(e)}"
+        )
+
+
+ALLOWED_BUSINESS_GOALS = {
+    'increase_profit',
+    'increase_revenue',
+    'reduce_inventory',
+    'improve_cash_flow',
+    'reduce_waste',
+    'prepare_expansion',
+    'open_branch'
+}
+
+
+@app.post("/api/business-goal")
+def update_business_goal(
+    request: UpdateBusinessGoalRequest,
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user)
+):
+    """
+    Updates or sets the user's business goal in their profile.
+    """
+    # Validate goal
+    if request.business_goal not in ALLOWED_BUSINESS_GOALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid business goal. Allowed values: {', '.join(sorted(ALLOWED_BUSINESS_GOALS))}"
+        )
+
+    try:
+        current_user.supabase.table('profiles').upsert({
+            'id': current_user.id,
+            'business_goal': request.business_goal
+        }).execute()
+
+        return {
+            "status": "success",
+            "message": "Business goal updated successfully"
+        }
+    except Exception as e:
+        logger.exception(f"Failed to update business goal: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update business goal: {str(e)}"
+        )
+
+
+@app.get("/api/root-cause-analysis", response_model=RootCauseAnalysisResponse)
+def get_root_cause_analysis(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
+    """
+    Returns the AI root cause analysis: identifies performance issues,
+    calculates financial impact, severity, confidence, and provides actionable recommendations.
+    """
+    try:
+        result = calculate_root_causes(current_user.id, current_user.supabase)
+        return to_native(result)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="Business data files not found. Run create_dataset.py before starting the API."
+        )
+    except Exception:
+        logger.exception("Unexpected error while generating root cause analysis")
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong generating the root cause analysis. Check server logs."
+        )
+
+
+@app.post("/api/user/update-phone")
+def update_phone_number(
+    request: UpdatePhoneRequest,
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user)
+):
+    """
+    Updates the user's phone number in their Supabase profile.
+    """
+    try:
+        current_user.supabase.table('profiles').upsert({
+            'id': current_user.id,
+            'phone_number': request.phone_number
+        }).execute()
+
+        return {
+            "status": "success",
+            "message": "Phone number updated successfully"
+        }
+    except Exception as e:
+        logger.exception(f"Failed to update phone number: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update phone number: {str(e)}"
+        )
+
+
+@app.post("/api/alerts/send-whatsapp")
+def send_whatsapp_alert(
+    request: WhatsAppAlertRequest,
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user)
+):
+    """
+    Sends a WhatsApp message with current health score and top reorder items.
+    Requires Twilio credentials to be configured.
+    """
+    if not twilio_client or not TWILIO_WHATSAPP_NUMBER:
+        raise HTTPException(
+            status_code=503,
+            detail="WhatsApp service not configured. Please set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_WHATSAPP_NUMBER environment variables."
+        )
+
+    try:
+        # Get user's phone number from Supabase profile
+        profile_result = current_user.supabase.table('profiles').select('phone_number').eq('id', current_user.id).maybe_single().execute()
+        user_phone = profile_result.data.get('phone_number') if profile_result.data else None
+
+        if not user_phone:
+            raise HTTPException(
+                status_code=400,
+                detail="No phone number found in your profile. Please add your phone number in settings."
+            )
+
+        # Get current insights
+        insights = get_all_insights(current_user.id)
+        health_score = insights.get('health_score', {})
+        reorder_items = insights.get('reorder', [])
+
+        # Format phone number for WhatsApp (ensure it has country code)
+        if not user_phone.startswith('+'):
+            user_phone = '+91' + user_phone  # Default to India country code
+
+        # Build message
+        score = health_score.get('score', 0)
+        label = health_score.get('label', 'Unknown')
+        
+        # Get top 3 urgent reorder items
+        urgent_reorders = sorted(reorder_items, key=lambda x: x.get('days_of_stock_left', 999))[:3]
+        reorder_text = ', '.join([
+            f"{item['product']} ({item['days_of_stock_left']:.1f} days left)" 
+            for item in urgent_reorders
+        ]) if urgent_reorders else 'No urgent reorders'
+
+        # Get profit trend
+        profit_analysis = insights.get('profit_analysis', {})
+        profit_change = profit_analysis.get('total_profit_change', 0)
+        profit_trend = "up" if profit_change >= 0 else "down"
+        profit_pct = abs(profit_change)
+
+        message = (
+            f"📊 Business Health: {score}/100 ({label})\n"
+            f"⚠️ Reorder soon: {reorder_text}\n"
+            f"💰 This week's profit trend: {profit_trend} {profit_pct:.0f}% vs last week"
+        )
+
+        # Send WhatsApp message
+        message_obj = twilio_client.messages.create(
+            body=message,
+            from_=f"whatsapp:{TWILIO_WHATSAPP_NUMBER}",
+            to=f"whatsapp:{user_phone}"
+        )
+
+        logger.info(f"WhatsApp message sent to user {current_user.id}: {message_obj.sid}")
+
+        return {
+            "status": "success",
+            "message": "WhatsApp alert sent successfully",
+            "message_sid": message_obj.sid
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to send WhatsApp alert: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send WhatsApp alert: {str(e)}"
+        )
+
+
 
 
 @app.get("/insights", response_model=InsightsResponse)
-def insights():
+def insights(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
     """
     Runs the full diagnostic: profit driver analysis, stop-selling
     candidates, urgent reorder recommendations, a merged priority action
@@ -672,7 +1272,7 @@ def insights():
     board-meeting-style executive summary.
     """
     try:
-        result = get_all_insights()
+        result = get_all_insights(current_user.id)
         return result
     except FileNotFoundError as e:
         logger.error(f"Data file missing: {e}")
@@ -689,14 +1289,15 @@ def insights():
 
 
 @app.get("/executive-summary", response_model=ExecutiveSummaryResponse)
-def executive_summary():
+def executive_summary(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
     """
     Returns the board-meeting opening narrative with structured fields —
     health score, forecast, top risk/opportunity, and LLM-written prose.
     """
     try:
-        sales, inventory = load_data()
-        result = get_executive_summary(sales, inventory)
+        sales, inventory = load_data(current_user.id)
+        config = get_config(current_user.id)
+        result = get_executive_summary(sales, inventory, config.get("mode", "demo"))
         return to_native({
             "narrative": result["narrative"],
             "health_score": result["health_score"],
@@ -720,14 +1321,14 @@ def executive_summary():
 
 
 @app.get("/export-report")
-def export_report():
+def export_report(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
     """
     Generates a formatted PDF version of the current diagnostic report —
     vitals, priority actions, alerts, and full breakdown — so the owner
     can download, print, or share it with a partner or supplier.
     """
     try:
-        insights = get_all_insights()
+        insights = get_all_insights(current_user.id)
         pdf_buffer = build_pdf_report(insights)
         return StreamingResponse(
             pdf_buffer,
@@ -748,7 +1349,7 @@ def export_report():
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(request: AskRequest):
+def ask(request: AskRequest, current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
     """
     Accepts a natural-language business question and routes it to the
     relevant diagnostic, returning a conversational answer backed by
@@ -762,7 +1363,7 @@ def ask(request: AskRequest):
     history = SESSION_HISTORY.get(session_id, []) if session_id else []
 
     try:
-        result = ask_question(request.question, history=history)
+        result = ask_question(request.question, history=history, user_id=current_user.id)
         result = to_native(result)
 
         if session_id:
@@ -784,7 +1385,7 @@ def ask(request: AskRequest):
 
 
 @app.post("/simulate", response_model=SimulateResponse)
-def simulate(request: SimulateRequest):
+def simulate(request: SimulateRequest, current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
     """
     What-if scenario: adjusts a product's demand by a percentage and
     returns recalculated stock runway and profit impact.
@@ -793,7 +1394,7 @@ def simulate(request: SimulateRequest):
         raise HTTPException(status_code=400, detail="Product name cannot be empty.")
 
     try:
-        result = simulate_scenario(request.product.strip(), request.demand_change_pct)
+        result = simulate_scenario(request.product.strip(), request.demand_change_pct, user_id=current_user.id)
         return to_native(result)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -811,13 +1412,13 @@ def simulate(request: SimulateRequest):
 
 
 @app.post("/advisor-panel", response_model=AdvisorPanelResponse)
-def advisor_panel():
+def advisor_panel(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
     """
     Runs three concurrent Groq calls — Finance, Operations, and Marketing
     advisors — each giving a grounded take on the current business data.
     """
     try:
-        sales, inventory = load_data()
+        sales, inventory = load_data(current_user.id)
         result = get_advisor_panel(sales, inventory)
         return to_native(result)
     except FileNotFoundError:
@@ -831,3 +1432,19 @@ def advisor_panel():
             status_code=500,
             detail="Something went wrong consulting the advisor panel. Check server logs."
         )
+
+
+# ---------- Manual Test Endpoint (TEMPORARY) ----------
+# NOTE: This endpoint is for testing only!
+# It should be removed or protected with authentication before production use!
+@app.post("/api/test-daily-report")
+def test_daily_report():
+    """
+    Manual test trigger for the daily report (temporary for testing only!)
+    """
+    try:
+        run_daily_report()
+        return {"status": "success", "message": "Daily report triggered successfully — check logs for details"}
+    except Exception as e:
+        logger.exception("Test daily report failed")
+        raise HTTPException(status_code=500, detail=f"Test failed: {str(e)}")

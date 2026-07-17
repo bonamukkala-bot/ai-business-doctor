@@ -1,46 +1,20 @@
 import { useState, useEffect, useRef } from 'react'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import axios from 'axios'
-import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
-} from 'recharts'
+import { useAuth } from './AuthContext.jsx'
+import SignupLogin from './SignupLogin.jsx'
+import DashboardLayout from './DashboardLayout.jsx'
+import DashboardPage from './pages/DashboardPage.jsx'
+import SalesPage from './pages/SalesPage.jsx'
+import InventoryPage from './pages/InventoryPage.jsx'
+import AdvisorsPage from './pages/AdvisorsPage.jsx'
+import ConsultPage from './pages/ConsultPage.jsx'
+import SettingsPage from './pages/SettingsPage.jsx'
+import OnboardingWizard from './pages/OnboardingWizard.jsx'
+import Skeleton from './components/Skeleton.jsx'
 import './App.css'
+import './styles/auth.css'
 import { API_BASE_URL } from './config'
-
-function HealthGauge({ score, label, colorClass }) {
-  const radius = 54
-  const circumference = 2 * Math.PI * radius
-  const isPending = label === "Pending"
-  const displayScore = isPending ? "--" : score
-  const offset = isPending ? circumference : circumference - (Math.min(score, 100) / 100) * circumference
-
-  return (
-    <div className={`health-gauge ${colorClass} ${isPending ? 'gauge-pending' : ''}`}>
-      <svg viewBox="0 0 140 140" className="gauge-svg">
-        <circle cx="70" cy="70" r={radius} className="gauge-track" />
-        <circle
-          cx="70" cy="70" r={radius}
-          className="gauge-fill"
-          strokeDasharray={circumference}
-          strokeDashoffset={offset}
-        />
-      </svg>
-      <div className="gauge-center">
-        <span className="gauge-score">{displayScore}</span>
-        <span className="gauge-label">{label}</span>
-      </div>
-    </div>
-  )
-}
-
-function Skeleton({ className = '', lines = 1 }) {
-  return (
-    <div className={`skeleton-wrap ${className}`}>
-      {Array.from({ length: lines }).map((_, i) => (
-        <div key={i} className="skeleton-line" style={{ width: i === lines - 1 && lines > 1 ? '70%' : '100%' }} />
-      ))}
-    </div>
-  )
-}
 
 function App() {
   const [insights, setInsights] = useState(null)
@@ -51,6 +25,10 @@ function App() {
   const [execSummary, setExecSummary] = useState(null)
   const [execLoading, setExecLoading] = useState(true)
   const [execError, setExecError] = useState(null)
+  
+  const [rootCauseAnalysis, setRootCauseAnalysis] = useState(null)
+  const [rootCauseLoading, setRootCauseLoading] = useState(true)
+  const [rootCauseError, setRootCauseError] = useState(null)
 
   const [question, setQuestion] = useState('')
   const [chatHistory, setChatHistory] = useState([])
@@ -86,7 +64,17 @@ function App() {
   const [uploadError, setUploadError] = useState(null)
   const [uploadSuccess, setUploadSuccess] = useState(null)
 
+  const { session, user, loading: authLoading, signOut } = useAuth()
+  const onboardingComplete = user?.user_metadata?.onboarding_complete === true
   const lastModifiedRef = useRef(null)
+
+  useEffect(() => {
+    if (session?.access_token) {
+      axios.defaults.headers.common.Authorization = `Bearer ${session.access_token}`
+    } else {
+      delete axios.defaults.headers.common.Authorization
+    }
+  }, [session])
 
   const refreshDashboard = async () => {
     setLoading(true)
@@ -127,11 +115,24 @@ function App() {
     } catch (err) {
       console.error('Failed to fetch data status', err)
     }
+
+    setRootCauseLoading(true)
+    try {
+      const rootCauseRes = await axios.get(`${API_BASE_URL}/api/root-cause-analysis`)
+      setRootCauseAnalysis(rootCauseRes.data)
+      setRootCauseError(null)
+    } catch (err) {
+      setRootCauseError('Root cause analysis unavailable — check backend logs.')
+    } finally {
+      setRootCauseLoading(false)
+    }
   }
 
   useEffect(() => {
-    refreshDashboard()
-  }, [])
+    if (session) {
+      refreshDashboard()
+    }
+  }, [session])
 
   const getRelativeTime = (timestamp) => {
     if (!timestamp) return 'unknown'
@@ -363,6 +364,20 @@ function App() {
     }
   }
 
+  if (authLoading) {
+    return (
+      <div className="scan-screen">
+        <div className="scan-ring" />
+        <p>Checking authentication…</p>
+        <Skeleton lines={2} className="scan-skeleton" />
+      </div>
+    )
+  }
+
+  if (!session) {
+    return <SignupLogin />
+  }
+
   if (loading) {
     return (
       <div className="scan-screen">
@@ -413,597 +428,155 @@ function App() {
   const products = raw_summary?.map(r => r.product) ?? []
 
   return (
-    <div className={`app ${loaded ? 'app-loaded' : ''}`}>
-      <header className="header">
-        <div className="header-brand">
-          <div className="brand-mark">✚</div>
-          <div>
-            <h1>AI Business Doctor</h1>
-            <p className="subtitle">Executive diagnostic · Live intelligence</p>
-          </div>
-        </div>
-        <div className="header-actions">
-          <a href={`${API_BASE_URL}/export-report`} className="btn-ghost" download="business_diagnosis_report.pdf">
-            Download Report
-          </a>
-          <span className={`status-pill ${isProfitDown ? 'critical' : 'healthy'}`}>
-            {isProfitDown ? 'Attention Needed' : 'Stable'}
-          </span>
-        </div>
-      </header>
-
-      {/* Data Source Panel */}
-      <section className="data-source-card card-interactive">
-        <div className="data-source-header">
-          <div className="source-info">
-            <span className="section-eyebrow">Data Connection</span>
-            <div className="source-status-row">
-              <span className={`badge-status ${dataStatus?.source === 'live' ? 'badge-live' : (dataStatus?.source === 'uploaded' ? 'badge-uploaded' : 'badge-demo')}`}>
-                {dataStatus?.source === 'live' ? '🔴 Live Connected' : (dataStatus?.source === 'uploaded' ? 'Your Data' : 'Demo Data')}
-              </span>
-              {dataStatus?.source === 'live' && (
-                <span className="live-indicator-dot"></span>
-              )}
-              {dataStatus && (
-                <span className="source-meta">
-                  {dataStatus.source === 'live' ? (
-                    <>
-                      Watching sales file: <strong>{getFilename(dataStatus.sales_path)}</strong> (updated {getRelativeTime(dataStatus.last_modified)})
-                      <br />
-                      <span className="history-captured-text">
-                        {dataStatus.days_of_history_captured ?? 0} days of history captured — {
-                          (dataStatus.days_of_history_captured ?? 0) < 15 
-                            ? `full trends available from day 15` 
-                            : `full trends available!`
-                        }
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      Coverage: <strong>{dataStatus.date_range}</strong> ({dataStatus.days} days, {dataStatus.products} products)
-                    </>
-                  )}
-                </span>
-              )}
-            </div>
-          </div>
-          <div className="source-actions">
-            <button className="btn-ghost" onClick={() => {
-              setShowUploadForm(!showUploadForm);
-              setUploadError(null);
-              setUploadSuccess(null);
-            }}>
-              {showUploadForm ? 'Close Panel' : 'Manage Data'}
-            </button>
-            {dataStatus?.source === 'live' ? (
-              <button className="btn-reset" onClick={handleDisconnectLive}>
-                Disconnect Live
-              </button>
-            ) : (
-              dataStatus?.source === 'uploaded' && (
-                <button className="btn-reset" onClick={handleResetDemo}>
-                  Reset to Demo Data
-                </button>
-              )
-            )}
-          </div>
-        </div>
-
-        {showUploadForm && (
-          <div className="drawer-container">
-            <div className="panel-tabs">
-              <button 
-                type="button" 
-                className={`tab-btn ${connectionType === 'upload' ? 'active' : ''}`}
-                onClick={() => { setConnectionType('upload'); setUploadError(null); setUploadSuccess(null); }}
-              >
-                CSV/Excel Upload
-              </button>
-              <button 
-                type="button" 
-                className={`tab-btn ${connectionType === 'live' ? 'active' : ''}`}
-                onClick={() => { setConnectionType('live'); setUploadError(null); setUploadSuccess(null); }}
-              >
-                Connect Live File
-              </button>
-            </div>
-
-            {connectionType === 'upload' ? (
-              <form className="upload-drawer" onSubmit={handleUpload}>
-                <h3>Upload Store Data</h3>
-                <p className="upload-instructions">
-                  Provide your sales and inventory records in CSV or Excel (XLSX) format. The system validates required column structures and values in real-time.
-                </p>
-                
-                <div className="file-inputs-row">
-                  <div className="file-input-group">
-                    <label>Sales File <span className="req-cols">(Supports .csv, .xlsx; needs: date, product, units_sold, revenue, profit)</span></label>
-                    <input 
-                      type="file" 
-                      accept=".csv,.xlsx,.xls" 
-                      onChange={e => {
-                        setSalesFile(e.target.files[0] || null)
-                        setUploadError(null)
-                        setUploadSuccess(null)
-                      }}
-                      required
-                    />
-                    {salesFile && <span className="selected-filename">✓ {salesFile.name}</span>}
-                  </div>
-
-                  <div className="file-input-group">
-                    <label>Inventory File <span className="req-cols">(Supports .csv, .xlsx; needs: product, current_stock, unit_cost)</span></label>
-                    <input 
-                      type="file" 
-                      accept=".csv,.xlsx,.xls" 
-                      onChange={e => {
-                        setInventoryFile(e.target.files[0] || null)
-                        setUploadError(null)
-                        setUploadSuccess(null)
-                      }}
-                      required
-                    />
-                    {inventoryFile && <span className="selected-filename">✓ {inventoryFile.name}</span>}
-                  </div>
-                </div>
-
-                {uploadError && <div className="upload-message error-msg">{uploadError}</div>}
-                {uploadSuccess && <div className="upload-message success-msg">{uploadSuccess}</div>}
-
-                <div className="upload-submit-row">
-                  <button type="submit" className="btn-primary" disabled={uploading || !salesFile || !inventoryFile}>
-                    {uploading ? 'Validating & Uploading...' : 'Upload files'}
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <form className="upload-drawer" onSubmit={handleConnectLive}>
-                <h3>Connect Local Live Files</h3>
-                <p className="upload-instructions">
-                  Enter the absolute paths to your sales and inventory spreadsheets on this machine. The system validates the files' format in real-time, and will automatically monitor them for updates.
-                  <br />
-                  <span className="help-note">Note: This only works when the backend engine runs on the same machine where these files reside (or a shared local directory).</span>
-                </p>
-                
-                <div className="file-inputs-row">
-                  <div className="file-input-group">
-                    <label htmlFor="live-sales-path">Sales File Path <span className="req-cols">(Supports .csv, .xlsx, .xls; e.g. C:\Users\YourName\Documents\sales.xlsx)</span></label>
-                    <input 
-                      id="live-sales-path"
-                      type="text"
-                      className="text-input"
-                      value={liveSalesPath}
-                      onChange={e => {
-                        setLiveSalesPath(e.target.value)
-                        setUploadError(null)
-                        setUploadSuccess(null)
-                      }}
-                      placeholder="e.g. C:\Users\YourName\Documents\sales_data.xlsx"
-                      required
-                    />
-                  </div>
-
-                  <div className="file-input-group">
-                    <label htmlFor="live-inventory-path">Inventory File Path <span className="req-cols">(Supports .csv, .xlsx, .xls; e.g. C:\Users\YourName\Documents\inventory.xlsx)</span></label>
-                    <input 
-                      id="live-inventory-path"
-                      type="text"
-                      className="text-input"
-                      value={liveInventoryPath}
-                      onChange={e => {
-                        setInventoryFile(null) // Reset standard upload file
-                        setLiveInventoryPath(e.target.value)
-                        setUploadError(null)
-                        setUploadSuccess(null)
-                      }}
-                      placeholder="e.g. C:\Users\YourName\Documents\inventory_data.xlsx"
-                      required
-                    />
-                  </div>
-                </div>
-
-                {uploadError && <div className="upload-message error-msg">{uploadError}</div>}
-                {uploadSuccess && <div className="upload-message success-msg">{uploadSuccess}</div>}
-
-                <div className="upload-submit-row">
-                  <button type="submit" className="btn-primary" disabled={uploading || !liveSalesPath.trim() || !liveInventoryPath.trim()}>
-                    {uploading ? 'Connecting...' : 'Connect Live Files'}
-                  </button>
-                </div>
-              </form>
-            )}
-          </div>
-        )}
-      </section>
-
-      {/* Board Meeting Hero */}
-      <section className="board-hero card-interactive">
-        <div className="board-hero-header">
-          <span className="section-eyebrow">Board Meeting</span>
-          <span className="live-dot">Live</span>
-        </div>
-        {execLoading ? (
-          <div className="board-hero-body">
-            <Skeleton lines={4} />
-            <p className="board-loading-text">Composing executive briefing…</p>
-          </div>
-        ) : execError ? (
-          <div className="board-hero-body">
-            <p className="board-narrative fallback">{execError}</p>
-          </div>
-        ) : (
-          <div className="board-hero-body">
-            <p className="board-narrative">{execSummary?.narrative}</p>
-            {execSummary && (
-              <div className="board-meta">
-                <div className="board-meta-item">
-                  <span className="meta-label">Forecast (15d)</span>
-                  <span className="meta-value">
-                    {execSummary.insufficient_data 
-                      ? 'Awaiting history' 
-                      : `Rs ${execSummary.profit_forecast_next_15_days?.toLocaleString()}`}
-                  </span>
-                </div>
-                <div className="board-meta-item">
-                  <span className="meta-label">Top Risk</span>
-                  <span className="meta-value risk">{execSummary.top_risk}</span>
-                </div>
-                <div className="board-meta-item">
-                  <span className="meta-label">Opportunity</span>
-                  <span className="meta-value opp">{execSummary.top_opportunity}</span>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </section>
-
-      {/* Health + Chart */}
-      <section className="health-chart-row">
-        <div className="health-centerpiece card-interactive">
-          <span className="section-eyebrow">Vitals</span>
-          <h2 className="section-title">Business Health</h2>
-          <HealthGauge score={hsScore} label={hsLabel} colorClass={hsColorClass} />
-          {hsReasons.length > 0 && (
-            <ul className="health-breakdown">
-              {hsReasons.slice(0, 4).map((r, i) => (
-                <li key={i}>{r}</li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        <div className="profit-chart-card card-interactive">
-          <span className="section-eyebrow">Trend</span>
-          <h2 className="section-title">30-Day Profit</h2>
-          {insights?.insufficient_data ? (
-            <div className="chart-placeholder">
-              <p className="placeholder-msg">
-                Still learning your business — check back after a few more days of data (at least 15 days) to see profit trends.
-              </p>
-            </div>
-          ) : (
-            <div className="chart-container">
-              <ResponsiveContainer width="100%" height={220}>
-                <LineChart data={profit_trend} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(61,171,168,0.12)" />
-                  <XAxis dataKey="date" tick={{ fill: '#7A8F9A', fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fill: '#7A8F9A', fontSize: 11 }} axisLine={false} tickLine={false} width={50} />
-                  <Tooltip
-                    contentStyle={{ background: '#141C24', border: '1px solid #2A3A44', borderRadius: 8, fontSize: 12 }}
-                    labelStyle={{ color: '#9BB0BC' }}
-                    itemStyle={{ color: '#3DABA8' }}
+    <BrowserRouter>
+      <div className={`app ${loaded ? 'app-loaded' : ''}`}>
+        <Routes>
+          <Route
+            path="/"
+            element={
+              <DashboardLayout
+                user={user}
+                healthStatus={{
+                  label: isProfitDown ? 'Attention Needed' : 'Stable',
+                  className: isProfitDown ? 'critical' : 'healthy'
+                }}
+                reportLink={`${API_BASE_URL}/export-report`}
+              />
+            }
+          >
+            <Route index element={<Navigate to={onboardingComplete ? '/dashboard' : '/onboarding'} replace />} />
+            <Route
+              path="dashboard"
+              element={
+                onboardingComplete ? (
+                  <DashboardPage
+                    user={user}
+                    insights={insights}
+                    execSummary={execSummary}
+                    execLoading={execLoading}
+                    execError={execError}
+                    healthScore={hsScore}
+                    healthLabel={hsLabel}
+                    healthReasons={hsReasons}
+                    isProfitDown={isProfitDown}
+                    rootCauseAnalysis={rootCauseAnalysis}
+                    rootCauseLoading={rootCauseLoading}
+                    rootCauseError={rootCauseError}
                   />
-                  <Line type="monotone" dataKey="profit" stroke="#3DABA8" strokeWidth={2.5} dot={false} activeDot={{ r: 4, fill: '#3DABA8' }} />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </div>
-      </section>
-
-      {/* Vitals Row */}
-      <section className="vitals-row">
-        <div className={`vital-card card-interactive ${isProfitDown && !insights?.insufficient_data ? 'critical' : 'healthy'}`}>
-          <span className="vital-label">Profit (15 days)</span>
-          <span className="vital-value">
-            {insights?.insufficient_data 
-              ? 'Awaiting history' 
-              : `${isProfitDown ? '↓' : '↑'} Rs ${Math.abs(profit_analysis.total_profit_change).toLocaleString()}`}
-          </span>
-        </div>
-        <div className="vital-card card-interactive warning">
-          <span className="vital-label">Stop-Selling</span>
-          <span className="vital-value">{stop_selling.length}</span>
-        </div>
-        <div className="vital-card card-interactive critical">
-          <span className="vital-label">Urgent Reorders</span>
-          <span className="vital-value">{reorder.length}</span>
-        </div>
-        <div className="vital-card card-interactive">
-          <span className="vital-label">Active Alerts</span>
-          <span className="vital-value">{anomalyList.length}</span>
-        </div>
-      </section>
-
-      {/* Priority Actions */}
-      {priorityList.length > 0 && (
-        <section className="priority-section">
-          <div className="section-head">
-            <span className="section-eyebrow">Action Plan</span>
-            <h2 className="section-title">Priority Actions</h2>
-          </div>
-          <ol className="priority-list">
-            {priorityList.map((a, i) => (
-              <li className={`priority-item card-interactive urgency-${(a.urgency_label || '').toLowerCase()}`} key={i}>
-                <span className="priority-rank">{a.rank ?? i + 1}</span>
-                <div className="priority-content">
-                  <div className="priority-top">
-                    <span className="priority-product">{a.product}</span>
-                    {a.urgency_label && (
-                      <span className={`tag ${urgencyClass(a.urgency_label)}`}>{a.urgency_label}</span>
-                    )}
-                  </div>
-                  <p className="priority-action">{a.recommended_action}</p>
-                  <span className="priority-impact">Rs {a.impact_rupees?.toLocaleString()} impact</span>
-                </div>
-              </li>
-            ))}
-          </ol>
-        </section>
-      )}
-
-      {/* Anomaly Alerts */}
-      {anomalyList.length > 0 && (
-        <section className="alerts-section">
-          <div className="section-head">
-            <span className="section-eyebrow">Proactive</span>
-            <h2 className="section-title">Anomaly Alerts</h2>
-          </div>
-          <div className="alerts-grid">
-            {anomalyList.map((a, i) => (
-              <div
-                className={`alert-card card-interactive ${a.severity === 'critical' ? 'pulse-critical' : ''}`}
-                key={i}
-              >
-                <div className="alert-header">
-                  <span className="alert-product">{a.product}</span>
-                  <span className={`tag ${urgencyClass(a.severity)}`}>{a.severity}</span>
-                </div>
-                <p className="alert-message">{a.message}</p>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* What-If Simulator */}
-      <section className="simulator-section card-interactive">
-        <div className="section-head">
-          <span className="section-eyebrow">Scenario</span>
-          <h2 className="section-title">What-If Simulator</h2>
-        </div>
-        <div className="simulator-controls">
-          <div className="sim-field">
-            <label htmlFor="sim-product">Product</label>
-            <select
-              id="sim-product"
-              value={simProduct}
-              onChange={e => { setSimProduct(e.target.value); setSimResult(null) }}
-            >
-              <option value="">Select a product…</option>
-              {products.map(p => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </div>
-          <div className="sim-field sim-slider-field">
-            <label htmlFor="sim-demand">
-              Demand change: <strong>{simDemand > 0 ? '+' : ''}{simDemand}%</strong>
-            </label>
-            <input
-              id="sim-demand"
-              type="range"
-              min={-50}
-              max={100}
-              value={simDemand}
-              onChange={e => { setSimDemand(Number(e.target.value)); setSimResult(null) }}
+                ) : (
+                  <Navigate to="/onboarding" replace />
+                )
+              }
             />
-            <div className="slider-labels"><span>-50%</span><span>+100%</span></div>
-          </div>
-          <button className="btn-primary" onClick={runSimulation} disabled={!simProduct || simLoading}>
-            {simLoading ? 'Running…' : 'Run Simulation'}
-          </button>
-        </div>
-        {simLoading && <Skeleton lines={2} className="sim-skeleton" />}
-        {simResult && !simLoading && (
-          <div className={`sim-result ${simResult.error ? 'sim-error' : ''}`}>
-            {simResult.error ? (
-              <p>{simResult.error}</p>
-            ) : (
-              <>
-                <div className="sim-metrics">
-                  <div><span>Stock runway</span><strong>{simResult.projected_days_of_stock_left} days</strong></div>
-                  <div><span>Was</span><strong>{simResult.baseline_days_of_stock_left} days</strong></div>
-                  <div><span>7-day profit impact</span><strong>Rs {simResult.projected_profit_impact?.toLocaleString()}</strong></div>
-                </div>
-                <p className="sim-action">{simResult.recommended_action}</p>
-              </>
-            )}
-          </div>
-        )}
-      </section>
-
-      {/* Panel of Advisors */}
-      <section className="advisors-section">
-        <div className="section-head section-head-row">
-          <div>
-            <span className="section-eyebrow">Expertise</span>
-            <h2 className="section-title">Panel of Advisors</h2>
-          </div>
-          <button className="btn-primary" onClick={consultPanel} disabled={advisorLoading}>
-            {advisorLoading ? 'Consulting…' : 'Consult Panel'}
-          </button>
-        </div>
-        {advisorError && <p className="advisor-error">{advisorError}</p>}
-        {advisorLoading && (
-          <div className="advisors-grid">
-            {[1, 2, 3].map(i => (
-              <div className="advisor-card skeleton-advisor" key={i}><Skeleton lines={3} /></div>
-            ))}
-          </div>
-        )}
-        {advisorPanel && !advisorLoading && (
-          <div className="advisors-grid">
-            <div className="advisor-card finance card-interactive">
-              <div className="advisor-icon">₹</div>
-              <h3>Finance</h3>
-              <p>{advisorPanel.finance_take}</p>
-            </div>
-            <div className="advisor-card operations card-interactive">
-              <div className="advisor-icon">⚙</div>
-              <h3>Operations</h3>
-              <p>{advisorPanel.operations_take}</p>
-            </div>
-            <div className="advisor-card marketing card-interactive">
-              <div className="advisor-icon">◎</div>
-              <h3>Marketing</h3>
-              <p>{advisorPanel.marketing_take}</p>
-            </div>
-          </div>
-        )}
-        {!advisorPanel && !advisorLoading && !advisorError && (
-          <p className="advisor-placeholder">Three specialist advisors ready — each grounded in your live business data.</p>
-        )}
-      </section>
-
-      {/* Consult the Doctor */}
-      <section className="consult-section card-interactive">
-        <div className="section-head">
-          <span className="section-eyebrow">Interactive</span>
-          <h2 className="section-title">Consult the Doctor</h2>
-        </div>
-        <div className="chat-window">
-          {chatHistory.length === 0 && (
-            <p className="chat-placeholder">Ask anything about your sales, profit, or inventory.</p>
-          )}
-          {chatHistory.map((msg, i) => (
-            <div key={i} className={`chat-bubble ${msg.type}`}>
-              <span className="chat-role">{msg.type === 'question' ? 'You' : 'Doctor'}</span>
-              {msg.text}
-            </div>
-          ))}
-          {asking && (
-            <div className="chat-bubble answer thinking">
-              <span className="chat-role">Doctor</span>
-              <Skeleton lines={1} />
-            </div>
-          )}
-        </div>
-        <div className="suggested-questions">
-          {suggestedQuestions.map((sq, i) => (
-            <button key={i} className="chip" onClick={() => handleAsk(sq)} disabled={asking}>{sq}</button>
-          ))}
-        </div>
-        <form className="chat-form" onSubmit={e => { e.preventDefault(); handleAsk() }}>
-          <input
-            type="text"
-            value={question}
-            onChange={e => setQuestion(e.target.value)}
-            placeholder="Type your question…"
-            disabled={asking}
-          />
-          <button type="submit" className="btn-primary" disabled={asking || !question.trim()}>Ask</button>
-        </form>
-      </section>
-
-      {/* Report Toggle + Grid */}
-      <section className="report-section">
-        <div className="section-head section-head-row">
-          <div>
-            <span className="section-eyebrow">Deep Dive</span>
-            <h2 className="section-title">Full Report</h2>
-          </div>
-          <div className="view-toggle">
-            <button
-              className={reportView === 'raw' ? 'active' : ''}
-              onClick={() => setReportView('raw')}
-            >Raw Report</button>
-            <button
-              className={reportView === 'ai' ? 'active' : ''}
-              onClick={() => setReportView('ai')}
-            >AI Diagnosis</button>
-          </div>
-        </div>
-
-        {reportView === 'raw' ? (
-          <div className="raw-table-wrap card-interactive">
-            <table className="raw-table">
-              <thead>
-                <tr>
-                  <th>Product</th>
-                  <th>Units</th>
-                  <th>Revenue (Rs)</th>
-                  <th>Profit (Rs)</th>
-                  <th>Stock</th>
-                </tr>
-              </thead>
-              <tbody>
-                {raw_summary.map((row, i) => (
-                  <tr key={i}>
-                    <td>{row.product}</td>
-                    <td>{row.total_units}</td>
-                    <td>{row.total_revenue.toLocaleString()}</td>
-                    <td>{row.total_profit.toLocaleString()}</td>
-                    <td>{row.current_stock}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <p className="raw-caption">Raw numbers only — no interpretation. Toggle to AI Diagnosis to see explained recommendations.</p>
-          </div>
-        ) : (
-          <div className="report-grid">
-            <div className="report-card card-interactive">
-              <h3>Profit Movement</h3>
-              <p className="report-summary">{profit_analysis.summary}</p>
-              {profit_analysis.top_drivers.map((d, i) => (
-                <div className="finding" key={i}>
-                  <div className="finding-head">
-                    <span>{d.product}</span>
-                    <span className="negative">{d.pct_change}%</span>
-                  </div>
-                  <p>{d.reasoning}</p>
-                </div>
-              ))}
-            </div>
-            <div className="report-card card-interactive">
-              <h3>Consider Discontinuing</h3>
-              {stop_selling.map((s, i) => (
-                <div className="finding" key={i}>
-                  <div className="finding-head">
-                    <span>{s.product}</span>
-                    <span className="tag">{s.avg_daily_units}/day</span>
-                  </div>
-                  <p>{s.reasoning}</p>
-                </div>
-              ))}
-            </div>
-            <div className="report-card card-interactive">
-              <h3>Reorder Urgently</h3>
-              {reorder.map((r, i) => (
-                <div className="finding" key={i}>
-                  <div className="finding-head">
-                    <span>{r.product}</span>
-                    <span className="tag critical-tag">{r.days_of_stock_left}d left</span>
-                  </div>
-                  <p>{r.reasoning}</p>
-                  <span className="reorder-qty">Reorder: {r.recommended_reorder_qty} units</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </section>
-    </div>
+            <Route
+              path="sales"
+              element={
+                onboardingComplete ? (
+                  <SalesPage
+                    profitTrend={profit_trend}
+                    profitAnalysis={profit_analysis}
+                    rawSummary={raw_summary}
+                    reportView={reportView}
+                    setReportView={setReportView}
+                    stopSelling={stop_selling}
+                    reorder={reorder}
+                  />
+                ) : (
+                  <Navigate to="/onboarding" replace />
+                )
+              }
+            />
+            <Route
+              path="inventory"
+              element={
+                onboardingComplete ? (
+                  <InventoryPage stopSelling={stop_selling} reorder={reorder} />
+                ) : (
+                  <Navigate to="/onboarding" replace />
+                )
+              }
+            />
+            <Route
+              path="advisors"
+              element={
+                onboardingComplete ? (
+                  <AdvisorsPage
+                    advisorPanel={advisorPanel}
+                    advisorLoading={advisorLoading}
+                    advisorError={advisorError}
+                    consultPanel={consultPanel}
+                    simProduct={simProduct}
+                    simDemand={simDemand}
+                    simResult={simResult}
+                    simLoading={simLoading}
+                    products={products}
+                    setSimProduct={setSimProduct}
+                    setSimDemand={setSimDemand}
+                    runSimulation={runSimulation}
+                  />
+                ) : (
+                  <Navigate to="/onboarding" replace />
+                )
+              }
+            />
+            <Route
+              path="consult"
+              element={
+                onboardingComplete ? (
+                  <ConsultPage
+                    chatHistory={chatHistory}
+                    asking={asking}
+                    question={question}
+                    setQuestion={setQuestion}
+                    handleAsk={handleAsk}
+                    suggestedQuestions={suggestedQuestions}
+                  />
+                ) : (
+                  <Navigate to="/onboarding" replace />
+                )
+              }
+            />
+            <Route
+              path="settings"
+              element={
+                onboardingComplete ? (
+                  <SettingsPage
+                    dataStatus={dataStatus}
+                    showUploadForm={showUploadForm}
+                    connectionType={connectionType}
+                    liveSalesPath={liveSalesPath}
+                    liveInventoryPath={liveInventoryPath}
+                    salesFile={salesFile}
+                    inventoryFile={inventoryFile}
+                    uploading={uploading}
+                    uploadError={uploadError}
+                    uploadSuccess={uploadSuccess}
+                    handleUpload={handleUpload}
+                    handleConnectLive={handleConnectLive}
+                    handleDisconnectLive={handleDisconnectLive}
+                    handleResetDemo={handleResetDemo}
+                    setShowUploadForm={setShowUploadForm}
+                    setConnectionType={setConnectionType}
+                    setLiveSalesPath={setLiveSalesPath}
+                    setLiveInventoryPath={setLiveInventoryPath}
+                    setSalesFile={setSalesFile}
+                    setInventoryFile={setInventoryFile}
+                    user={user}
+                    signOut={signOut}
+                    getFilename={getFilename}
+                    getRelativeTime={getRelativeTime}
+                  />
+                ) : (
+                  <Navigate to="/onboarding" replace />
+                )
+              }
+            />
+          </Route>
+          <Route path="onboarding" element={<OnboardingWizard user={user} onComplete={refreshDashboard} />} />
+          <Route path="*" element={<Navigate to={onboardingComplete ? '/dashboard' : '/onboarding'} replace />} />
+        </Routes>
+      </div>
+    </BrowserRouter>
   )
 }
 
