@@ -2964,3 +2964,148 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   SMART DEAD INVENTORY RECOVERY
+   Follows the same token/class conventions as inv-optimizer and
+   root-cause sections. Reuses .metric-item, .severity-tag,
+   .rec-label, .rec-text, .root-cause-loading, etc.
+════════════════════════════════════════════════════════════════ */
+
+.dead-inv-section {
+  margin-top: 24px;
+  margin-bottom: 28px;
+}
+
+/* Capital-blocked pill in the section header */
+.dead-inv-blocked-pill {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 8px 14px;
+  background: rgba(212, 101, 90, 0.08);
+  border: 1px solid rgba(212, 101, 90, 0.22);
+  border-radius: 10px;
+}
+
+.dead-inv-blocked-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-muted);
+}
+
+.dead-inv-blocked-value {
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.1;
+  color: var(--critical);
+}
+
+/* Product card list */
+.dead-inv-list {
+  display: grid;
+  gap: 14px;
+}
+
+.dead-inv-item {
+  padding: 18px 20px;
+  background: var(--bg-inset);
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--critical);
+  transition: border-color var(--transition);
+}
+.dead-inv-item:hover {
+  border-color: var(--border);
+  border-left-color: var(--critical);
+}
+
+/* Header: name group left, strategy badge right */
+.dead-inv-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.dead-inv-title-group {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.dead-inv-product {
+  font-family: var(--serif);
+  font-size: 17px;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+/* Metrics grid — 4 cols on wide, 2 on medium */
+.dead-inv-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 12px;
+}
+
+/* Strategy block */
+.dead-inv-strategy {
+  margin-bottom: 12px;
+}
+
+.dead-inv-rule-basis {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-style: italic;
+  line-height: 1.4;
+}
+
+/* Estimates row */
+.dead-inv-estimates {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.dead-inv-estimate-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dead-inv-estimate-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+.dead-inv-estimate-value.recovery {
+  color: var(--accent);
+}
+
+/* Responsive */
+@media (max-width: 700px) {
+  .dead-inv-metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .dead-inv-estimates {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 420px) {
+  .dead-inv-metrics {
+    grid-template-columns: 1fr;
+  }
+}

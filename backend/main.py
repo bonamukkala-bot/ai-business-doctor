@@ -39,6 +39,7 @@ from analysis_engine import (
     generate_action_plan,
     predict_cash_flow,
     get_inventory_optimizer,
+    analyze_dead_inventory,
 )
 from pdf_report import build_pdf_report
 
@@ -404,6 +405,37 @@ class InventoryOptimizerResponse(BaseModel):
     trailing_days: int | None = None
     coverage_target_days: int | None = None
     safety_factor: float | None = None
+
+# ── Dead Inventory Recovery models ───────────────────────────────────────────
+
+class DeadInventoryItem(BaseModel):
+    product: str
+    category: str | None = None
+    days_without_sale: int | None = None
+    days_without_sale_label: str
+    never_sold: bool
+    current_stock: int
+    unit_cost: float
+    unit_price: float
+    dead_inventory_value: float
+    capital_blocked: float
+    margin_ratio: float
+    historical_daily_avg: float
+    strategy: str
+    strategy_label: str
+    strategy_description: str
+    strategy_rule_basis: str
+    expected_sales_increase: str
+    expected_profit_recovery: str
+    estimated_recovery_time: str
+
+class DeadInventoryResponse(BaseModel):
+    insufficient_data: bool = False
+    data_sufficiency_note: str | None = None
+    items: List[DeadInventoryItem]
+    total_capital_blocked: float
+    threshold_days: int
+    products_analyzed: int
 
 class AdvisorPanelResponse(BaseModel):
     finance_take: str
@@ -1366,6 +1398,36 @@ def get_inventory_optimizer_endpoint(
         raise HTTPException(
             status_code=500,
             detail="Something went wrong running the inventory optimizer. Check server logs."
+        )
+
+
+# ── Dead Inventory Recovery endpoint ─────────────────────────────────────────
+
+@app.get("/api/dead-inventory-recovery", response_model=DeadInventoryResponse)
+def get_dead_inventory_recovery(
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user)
+):
+    """
+    Identifies products with no sales for ≥ DEAD_INVENTORY_MIN_DAYS days,
+    calculates capital blocked, and recommends one recovery strategy per
+    product (flash sale, bundle, discount, buy-2-get-1, or cross-sell)
+    based on real price/margin/category data.
+
+    Does NOT modify recommend_stop_selling() or any other existing function.
+    """
+    try:
+        result = analyze_dead_inventory(current_user.id, current_user.supabase)
+        return to_native(result)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="Business data files not found. Upload your data before running dead inventory analysis."
+        )
+    except Exception:
+        logger.exception("Unexpected error running dead inventory recovery analysis")
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong running dead inventory recovery. Check server logs."
         )
 
 

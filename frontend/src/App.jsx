@@ -42,6 +42,10 @@ function App() {
   const [inventoryOptimizerLoading, setInventoryOptimizerLoading] = useState(true)
   const [inventoryOptimizerError, setInventoryOptimizerError] = useState(null)
 
+  const [deadInventory, setDeadInventory] = useState(null)
+  const [deadInventoryLoading, setDeadInventoryLoading] = useState(true)
+  const [deadInventoryError, setDeadInventoryError] = useState(null)
+
   const [question, setQuestion] = useState('')
   const [chatHistory, setChatHistory] = useState([])
   const [asking, setAsking] = useState(false)
@@ -170,6 +174,17 @@ function App() {
       setInventoryOptimizerError('Inventory optimizer unavailable — check backend logs.')
     } finally {
       setInventoryOptimizerLoading(false)
+    }
+
+    setDeadInventoryLoading(true)
+    try {
+      const deadInvRes = await axios.get(`${API_BASE_URL}/api/dead-inventory-recovery`)
+      setDeadInventory(deadInvRes.data)
+      setDeadInventoryError(null)
+    } catch (err) {
+      setDeadInventoryError('Dead inventory analysis unavailable — check backend logs.')
+    } finally {
+      setDeadInventoryLoading(false)
     }
   }
 
@@ -548,6 +563,9 @@ function App() {
                     inventoryOptimizer={inventoryOptimizer}
                     inventoryOptimizerLoading={inventoryOptimizerLoading}
                     inventoryOptimizerError={inventoryOptimizerError}
+                    deadInventory={deadInventory}
+                    deadInventoryLoading={deadInventoryLoading}
+                    deadInventoryError={deadInventoryError}
                   />
                 ) : (
                   <Navigate to="/onboarding" replace />
