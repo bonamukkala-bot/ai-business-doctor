@@ -2336,3 +2336,280 @@ body {
   font-size: 14px;
   padding: 24px;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   AI ACTION PLANNER
+   Sits directly below Root Cause Analysis — same card language,
+   same token palette. Never introduces new colours.
+════════════════════════════════════════════════════════════════ */
+
+.action-planner-card {
+  margin-bottom: 28px;
+}
+
+/* Savings banner in the section header */
+.action-planner-savings-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-glow);
+  border-radius: 20px;
+  padding: 6px 14px;
+  white-space: nowrap;
+}
+
+/* Task list container */
+.action-task-list {
+  display: grid;
+  gap: 12px;
+}
+
+/* Individual task card */
+.action-task-item {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  padding: 18px 20px;
+  background: var(--bg-inset);
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  transition: border-color var(--transition), background var(--transition);
+}
+
+.action-task-item:hover {
+  border-color: var(--border);
+  background: var(--bg-elevated);
+}
+
+/* Priority accent stripe via left-border tint */
+.action-task-item.priority-urgent {
+  border-left: 3px solid var(--critical);
+}
+.action-task-item.priority-high {
+  border-left: 3px solid var(--warning);
+}
+.action-task-item.priority-medium {
+  border-left: 3px solid var(--accent);
+}
+.action-task-item.priority-low {
+  border-left: 3px solid var(--border);
+}
+
+/* Completed task — subdued */
+.action-task-item.action-task-done {
+  opacity: 0.55;
+  border-left: 3px solid var(--border-subtle);
+}
+.action-task-item.action-task-done:hover {
+  opacity: 0.75;
+}
+
+/* Checkbox / circle button */
+.action-task-checkbox {
+  flex-shrink: 0;
+  margin-top: 2px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 0;
+  line-height: 1;
+  transition: color var(--transition), transform var(--transition);
+}
+.action-task-checkbox:hover:not(:disabled) {
+  color: var(--accent);
+  transform: scale(1.1);
+}
+.action-task-checkbox.done {
+  color: var(--accent);
+}
+.action-task-checkbox:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
+/* Spinner while request is in-flight */
+.action-task-spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Task body */
+.action-task-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.action-task-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.action-task-title {
+  font-family: var(--serif);
+  font-size: 17px;
+  color: var(--text-primary);
+  margin: 0;
+  line-height: 1.3;
+}
+.action-task-title.done {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+
+/* Priority badge — reuses same visual weight as severity-tag */
+.action-priority-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 9px;
+  border-radius: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  flex-shrink: 0;
+}
+.action-priority-badge.priority-badge-urgent {
+  background: rgba(212, 101, 90, 0.12);
+  color: var(--critical);
+  border: 1px solid rgba(212, 101, 90, 0.25);
+}
+.action-priority-badge.priority-badge-high {
+  background: rgba(212, 168, 67, 0.12);
+  color: var(--warning);
+  border: 1px solid rgba(212, 168, 67, 0.25);
+}
+.action-priority-badge.priority-badge-medium {
+  background: rgba(61, 171, 168, 0.1);
+  color: var(--accent);
+  border: 1px solid rgba(61, 171, 168, 0.2);
+}
+.action-priority-badge.priority-badge-low {
+  background: rgba(138, 155, 170, 0.1);
+  color: var(--text-secondary);
+  border: 1px solid rgba(138, 155, 170, 0.2);
+}
+.action-priority-badge.done {
+  opacity: 0.5;
+}
+
+/* Benefit text */
+.action-task-benefit {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.55;
+  margin-bottom: 12px;
+}
+
+/* Metrics row — reuses .metric-item/.metric-label/.metric-value from root cause */
+.action-task-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 10px;
+}
+
+/* Tags row: estimated time, difficulty, confidence */
+.action-task-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.action-task-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.action-task-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 3px 8px;
+}
+
+/* Completed timestamp */
+.action-task-completed-at {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 4px 0 6px;
+}
+
+/* "All done" empty state */
+.action-planner-all-done {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 32px 24px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+.all-done-icon {
+  color: var(--accent);
+}
+
+/* Completed tasks collapsible section */
+.action-completed-section {
+  margin-top: 16px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 14px;
+}
+
+.action-completed-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 4px 0;
+  transition: color var(--transition);
+}
+.action-completed-toggle:hover {
+  color: var(--text-secondary);
+}
+
+.action-completed-list {
+  margin-top: 12px;
+}
+
+/* ── Responsive: stack metrics on very small screens ── */
+@media (max-width: 480px) {
+  .action-task-metrics {
+    grid-template-columns: 1fr;
+  }
+  .action-planner-savings-badge {
+    font-size: 11px;
+    padding: 5px 10px;
+  }
+}

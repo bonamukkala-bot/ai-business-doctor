@@ -30,6 +30,10 @@ function App() {
   const [rootCauseLoading, setRootCauseLoading] = useState(true)
   const [rootCauseError, setRootCauseError] = useState(null)
 
+  const [actionPlan, setActionPlan] = useState(null)
+  const [actionPlanLoading, setActionPlanLoading] = useState(true)
+  const [actionPlanError, setActionPlanError] = useState(null)
+
   const [question, setQuestion] = useState('')
   const [chatHistory, setChatHistory] = useState([])
   const [asking, setAsking] = useState(false)
@@ -125,6 +129,17 @@ function App() {
       setRootCauseError('Root cause analysis unavailable — check backend logs.')
     } finally {
       setRootCauseLoading(false)
+    }
+
+    setActionPlanLoading(true)
+    try {
+      const actionPlanRes = await axios.get(`${API_BASE_URL}/api/action-plan`)
+      setActionPlan(actionPlanRes.data)
+      setActionPlanError(null)
+    } catch (err) {
+      setActionPlanError('Action plan unavailable — check backend logs.')
+    } finally {
+      setActionPlanLoading(false)
     }
   }
 
@@ -462,6 +477,10 @@ function App() {
                     rootCauseAnalysis={rootCauseAnalysis}
                     rootCauseLoading={rootCauseLoading}
                     rootCauseError={rootCauseError}
+                    actionPlan={actionPlan}
+                    actionPlanLoading={actionPlanLoading}
+                    actionPlanError={actionPlanError}
+                    onActionPlanChange={setActionPlan}
                   />
                 ) : (
                   <Navigate to="/onboarding" replace />

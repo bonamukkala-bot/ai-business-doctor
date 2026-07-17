@@ -1553,6 +1553,200 @@ def get_all_insights(user_id: int):
     return to_native(result)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AI ACTION PLANNER
+# Converts Root Cause Engine output into a prioritised daily task checklist.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import hashlib
+
+
+def _task_id_from_cause(cause: dict) -> str:
+    """
+    Derive a stable, collision-resistant task_id from the cause's product +
+    cause_type pair so the same underlying issue maps to the same row in
+    task_status across requests.
+    """
+    raw = f"{cause['product']}|{cause['cause_type']}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def _priority_tier(severity: str, financial_impact: float) -> str:
+    """
+    Map severity (from _create_root_cause) + financial_impact to a 4-level
+    priority tier.  Uses deterministic rules — no new scale invented.
+
+    Critical severity   → Urgent
+    High severity       → High
+    Medium + impact≥500 → High  (elevated because meaningful rupee risk)
+    Medium              → Medium
+    Low                 → Low
+    """
+    sev = severity.lower()
+    if sev == "critical":
+        return "Urgent"
+    if sev == "high":
+        return "High"
+    if sev == "medium" and financial_impact >= 500:
+        return "High"
+    if sev == "medium":
+        return "Medium"
+    return "Low"
+
+
+_TIER_ORDER = {"Urgent": 0, "High": 1, "Medium": 2, "Low": 3}
+
+
+def _task_heuristics(cause: dict) -> tuple[str, str]:
+    """
+    Return (estimated_time, difficulty) using a simple keyword heuristic on
+    cause_type.  Clearly labelled as estimates so users understand these are
+    rough guides, not measured figures.
+    """
+    ct = cause.get("cause_type", "").lower()
+    if "reorder" in ct or "stock" in ct:
+        return "~5 min (est.)", "Easy"
+    if "stop" in ct or "liquidat" in ct or "dead" in ct:
+        return "~10 min (est.)", "Easy"
+    if "margin" in ct or "pricing" in ct or "cost" in ct:
+        return "~20 min (est.)", "Medium"
+    if "sales_drop" in ct or "investigate" in ct:
+        return "~15 min (est.)", "Medium"
+    return "~10 min (est.)", "Medium"
+
+
+def _action_title(cause: dict) -> str:
+    """
+    Convert a cause into an action-oriented task title.
+    Follows pattern: <Verb> + <Product>   e.g. 'Reorder Cooking Oil' not
+    'Cooking oil is low'.
+    """
+    ct = cause.get("cause_type", "").lower()
+    product = cause.get("product", "Unknown")
+    if "reorder" in ct:
+        return f"Reorder {product}"
+    if "stop" in ct or "dead" in ct:
+        return f"Liquidate dead stock: {product}"
+    if "margin" in ct or "pricing" in ct:
+        return f"Review pricing for {product}"
+    if "sales_drop" in ct:
+        return f"Investigate sales drop: {product}"
+    if "cost" in ct:
+        return f"Audit costs for {product}"
+    # Fallback: use the original title if cause_type doesn't match patterns
+    return cause.get("title", f"Action: {product}")
+
+
+def _expected_benefit(cause: dict) -> str:
+    """
+    Derive a short benefit phrase from the existing explanation field —
+    nothing is fabricated.
+    """
+    explanation = cause.get("explanation", "")
+    recovery = cause.get("expected_recovery", 0)
+    if recovery > 0:
+        return f"Recover up to ₹{recovery:,.0f} — {explanation[:120].rstrip('.')}."
+    return explanation[:140].rstrip('.') + '.' if explanation else "Resolve identified issue."
+
+
+def generate_action_plan(user_id: str, authenticated_supabase_client) -> dict:
+    """
+    Converts Root Cause Engine output into a prioritised daily task checklist.
+
+    Steps:
+    1. Call calculate_root_causes() — no logic duplicated.
+    2. Map each cause → task with action-oriented title, priority tier,
+       financial figures (reused verbatim), heuristic time/difficulty, and
+       a benefit phrase derived from the existing explanation.
+    3. Sort by priority tier then financial_impact desc.
+    4. Load persisted task_status from Supabase for this user.
+    5. Split tasks into pending / completed.
+    6. total_potential_savings = sum of financial figures for pending tasks only.
+    """
+    root_cause_result = calculate_root_causes(user_id, authenticated_supabase_client)
+
+    # Propagate insufficient-data state immediately
+    if root_cause_result.get("insufficient_data"):
+        return {
+            "insufficient_data": True,
+            "data_sufficiency_note": root_cause_result.get("data_sufficiency_note", ""),
+            "pending": [],
+            "completed": [],
+            "total_potential_savings": 0.0,
+        }
+
+    causes = root_cause_result.get("causes", [])
+
+    # ── Build raw task list ────────────────────────────────────────────────
+    tasks = []
+    for cause in causes:
+        task_id = _task_id_from_cause(cause)
+        priority = _priority_tier(cause["severity"], cause["financial_impact"])
+        estimated_time, difficulty = _task_heuristics(cause)
+
+        # Reuse cause financial figures verbatim — never recalculate
+        profit_risk = cause["financial_impact"]
+        expected_saving = cause["expected_recovery"]
+
+        tasks.append({
+            "task_id": task_id,
+            "title": _action_title(cause),
+            "priority": priority,
+            "profit_risk": round(profit_risk, 2),
+            "expected_saving": round(expected_saving, 2),
+            "estimated_time": estimated_time,
+            "difficulty": difficulty,
+            "expected_benefit": _expected_benefit(cause),
+            # Keep cause context for UI display
+            "severity": cause["severity"],
+            "confidence": cause["confidence"],
+            "product": cause["product"],
+            "cause_type": cause["cause_type"],
+        })
+
+    # ── Sort: tier first, then financial_impact desc within tier ──────────
+    tasks.sort(
+        key=lambda t: (_TIER_ORDER.get(t["priority"], 99), -t["profit_risk"])
+    )
+
+    # ── Fetch persisted completion status from Supabase ───────────────────
+    completed_ids: set[str] = set()
+    completed_at_map: dict[str, str] = {}
+    try:
+        resp = authenticated_supabase_client.table("task_status") \
+            .select("task_id, status, completed_at") \
+            .eq("user_id", str(user_id)) \
+            .eq("status", "completed") \
+            .execute()
+        for row in (resp.data or []):
+            completed_ids.add(row["task_id"])
+            completed_at_map[row["task_id"]] = row.get("completed_at")
+    except Exception as e:
+        logger.warning(f"Could not load task_status for user {user_id}: {e}")
+        # Degrade gracefully — treat all as pending
+
+    # ── Split into pending / completed ────────────────────────────────────
+    pending = []
+    completed = []
+    for t in tasks:
+        if t["task_id"] in completed_ids:
+            completed.append({**t, "completed_at": completed_at_map.get(t["task_id"])})
+        else:
+            pending.append(t)
+
+    total_potential_savings = round(
+        sum(t["expected_saving"] for t in pending), 2
+    )
+
+    return {
+        "insufficient_data": False,
+        "data_sufficiency_note": None,
+        "pending": pending,
+        "completed": completed,
+        "total_potential_savings": total_potential_savings,
+    }
+
+
 if __name__ == "__main__":
     import json
     insights = get_all_insights(user_id=1)

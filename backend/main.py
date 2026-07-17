@@ -36,6 +36,7 @@ from analysis_engine import (
     send_daily_email,
     send_daily_whatsapp,
     calculate_root_causes,
+    generate_action_plan,
 )
 from pdf_report import build_pdf_report
 
@@ -317,6 +318,30 @@ class RootCauseAnalysisResponse(BaseModel):
     causes: List[RootCause]
     data_sufficiency_note: str | None = None
     insufficient_data: bool = False
+
+# ── Action Planner models ─────────────────────────────────────────────────────
+
+class ActionTask(BaseModel):
+    task_id: str
+    title: str
+    priority: str
+    profit_risk: float
+    expected_saving: float
+    estimated_time: str
+    difficulty: str
+    expected_benefit: str
+    severity: str
+    confidence: float
+    product: str
+    cause_type: str
+    completed_at: str | None = None
+
+class ActionPlanResponse(BaseModel):
+    insufficient_data: bool = False
+    data_sufficiency_note: str | None = None
+    pending: List[ActionTask]
+    completed: List[ActionTask]
+    total_potential_savings: float
 
 class AdvisorPanelResponse(BaseModel):
     finance_take: str
@@ -1150,6 +1175,76 @@ def get_root_cause_analysis(current_user: auth.SupabaseUser = Depends(auth.get_c
             status_code=500,
             detail="Something went wrong generating the root cause analysis. Check server logs."
         )
+
+
+# ── AI Action Planner endpoints ───────────────────────────────────────────────
+
+@app.get("/api/action-plan", response_model=ActionPlanResponse)
+def get_action_plan(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
+    """
+    Returns the current user's AI-generated action plan derived from the Root
+    Cause Engine.  Tasks are split into pending / completed based on stored
+    task_status, and total_potential_savings covers pending tasks only.
+    """
+    try:
+        result = generate_action_plan(current_user.id, current_user.supabase)
+        return to_native(result)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="Business data files not found. Upload your data before generating an action plan."
+        )
+    except Exception:
+        logger.exception("Unexpected error generating action plan")
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong generating the action plan. Check server logs."
+        )
+
+
+@app.post("/api/action-plan/{task_id}/complete")
+def complete_action_task(
+    task_id: str,
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user)
+):
+    """
+    Marks a task as completed for the current user.
+    Upserts into task_status (insert or update on conflict).
+    """
+    try:
+        import datetime as _dt
+        current_user.supabase.table("task_status").upsert({
+            "user_id": str(current_user.id),
+            "task_id": task_id,
+            "status": "completed",
+            "completed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }, on_conflict="user_id,task_id").execute()
+        return {"status": "success", "task_id": task_id, "new_status": "completed"}
+    except Exception:
+        logger.exception(f"Failed to mark task {task_id} complete for user {current_user.id}")
+        raise HTTPException(status_code=500, detail="Failed to mark task complete.")
+
+
+@app.post("/api/action-plan/{task_id}/reopen")
+def reopen_action_task(
+    task_id: str,
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user)
+):
+    """
+    Reverses a completed task back to pending — handles mis-clicks.
+    Upserts the row with status='pending' and clears completed_at.
+    """
+    try:
+        current_user.supabase.table("task_status").upsert({
+            "user_id": str(current_user.id),
+            "task_id": task_id,
+            "status": "pending",
+            "completed_at": None,
+        }, on_conflict="user_id,task_id").execute()
+        return {"status": "success", "task_id": task_id, "new_status": "pending"}
+    except Exception:
+        logger.exception(f"Failed to reopen task {task_id} for user {current_user.id}")
+        raise HTTPException(status_code=500, detail="Failed to reopen task.")
 
 
 @app.post("/api/user/update-phone")

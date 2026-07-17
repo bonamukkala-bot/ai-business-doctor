@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from 'react'
-import { ArrowUpRight, ArrowDownRight, TrendingUp, ShieldCheck, AlertTriangle, Package, Share2, MessageCircle, Globe } from 'lucide-react'
+import { ArrowUpRight, ArrowDownRight, TrendingUp, ShieldCheck, AlertTriangle, Package, Share2, MessageCircle, Globe, CheckCircle2, Circle, ChevronDown, ChevronUp, Clock, Zap } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import html2canvas from 'html2canvas'
 import HealthGauge from '../components/HealthGauge.jsx'
@@ -33,13 +33,17 @@ function buildSparklinePath(points, width = 100, height = 28) {
     .join(' ')
 }
 
-export default function DashboardPage({ user, insights, execSummary, execLoading, execError, healthScore, healthLabel, healthReasons, isProfitDown, rootCauseAnalysis, rootCauseLoading, rootCauseError }) {
+export default function DashboardPage({ user, insights, execSummary, execLoading, execError, healthScore, healthLabel, healthReasons, isProfitDown, rootCauseAnalysis, rootCauseLoading, rootCauseError, actionPlan, actionPlanLoading, actionPlanError, onActionPlanChange }) {
   const shopName = user?.user_metadata?.shop_name || user?.email?.split('@')[0] || 'Business Doctor'
   const greeting = useMemo(() => `${getGreeting()}, ${shopName}`, [shopName])
   const boardSummaryRef = useRef(null)
   const [selectedLanguage, setSelectedLanguage] = useState('english')
   const [languageCache, setLanguageCache] = useState({})
   const [translating, setTranslating] = useState(false)
+
+  // Action Planner local state
+  const [completingTaskId, setCompletingTaskId] = useState(null)
+  const [showCompleted, setShowCompleted] = useState(false)
 
   // Check if we have insufficient data or no data
   const hasInsufficientData = insights?.insufficient_data === true || !insights || !insights.profit_analysis
@@ -73,6 +77,64 @@ export default function DashboardPage({ user, insights, execSummary, execLoading
       alert('WhatsApp alert sent successfully!')
     } catch (error) {
       alert(error.response?.data?.detail || 'Failed to send WhatsApp alert. Please add your phone number in Settings.')
+    }
+  }
+
+  // ── Action Planner handlers ──────────────────────────────────────────────
+  const handleCompleteTask = async (taskId) => {
+    setCompletingTaskId(taskId)
+    try {
+      await axios.post(`${API_BASE_URL}/api/action-plan/${taskId}/complete`)
+      // Optimistic update: move the task from pending → completed locally
+      if (onActionPlanChange && actionPlan) {
+        const task = actionPlan.pending.find(t => t.task_id === taskId)
+        if (task) {
+          const completedTask = { ...task, completed_at: new Date().toISOString() }
+          const newPending = actionPlan.pending.filter(t => t.task_id !== taskId)
+          const newCompleted = [completedTask, ...actionPlan.completed]
+          const newSavings = newPending.reduce((sum, t) => sum + t.expected_saving, 0)
+          onActionPlanChange({
+            ...actionPlan,
+            pending: newPending,
+            completed: newCompleted,
+            total_potential_savings: Math.round(newSavings * 100) / 100,
+          })
+        }
+      }
+    } catch (err) {
+      console.error('Failed to mark task complete', err)
+    } finally {
+      setCompletingTaskId(null)
+    }
+  }
+
+  const handleReopenTask = async (taskId) => {
+    setCompletingTaskId(taskId)
+    try {
+      await axios.post(`${API_BASE_URL}/api/action-plan/${taskId}/reopen`)
+      // Optimistic update: move task from completed → pending locally
+      if (onActionPlanChange && actionPlan) {
+        const task = actionPlan.completed.find(t => t.task_id === taskId)
+        if (task) {
+          const { completed_at: _removed, ...reopenedTask } = task
+          const newCompleted = actionPlan.completed.filter(t => t.task_id !== taskId)
+          const newPending = [...actionPlan.pending, reopenedTask]
+          // Re-sort pending by tier then profit_risk desc
+          const tierOrder = { Urgent: 0, High: 1, Medium: 2, Low: 3 }
+          newPending.sort((a, b) => (tierOrder[a.priority] ?? 99) - (tierOrder[b.priority] ?? 99) || b.profit_risk - a.profit_risk)
+          const newSavings = newPending.reduce((sum, t) => sum + t.expected_saving, 0)
+          onActionPlanChange({
+            ...actionPlan,
+            pending: newPending,
+            completed: newCompleted,
+            total_potential_savings: Math.round(newSavings * 100) / 100,
+          })
+        }
+      }
+    } catch (err) {
+      console.error('Failed to reopen task', err)
+    } finally {
+      setCompletingTaskId(null)
     }
   }
 
@@ -418,6 +480,146 @@ export default function DashboardPage({ user, insights, execSummary, execLoading
                   <p className="root-cause-empty">No root causes detected. Your business is in good shape!</p>
                 )}
               </div>
+            )}
+          </section>
+
+          {/* ── AI Action Planner ─────────────────────────────────────── */}
+          <section className="action-planner-card card-interactive">
+            <div className="section-head section-head-row">
+              <div>
+                <span className="section-eyebrow">Action Planner</span>
+                <h2 className="section-title">Today's Tasks</h2>
+              </div>
+              {!actionPlanLoading && !actionPlanError && !actionPlan?.insufficient_data && actionPlan?.total_potential_savings > 0 && (
+                <div className="action-planner-savings-badge">
+                  <Zap size={13} />
+                  Complete today's tasks to save ~{formatCurrency(actionPlan.total_potential_savings)}
+                </div>
+              )}
+            </div>
+
+            {actionPlanLoading ? (
+              <div className="root-cause-loading">
+                <Skeleton lines={4} />
+                <p className="loading-text">Building your action plan…</p>
+              </div>
+            ) : actionPlanError ? (
+              <p className="root-cause-error">{actionPlanError}</p>
+            ) : actionPlan?.insufficient_data ? (
+              <div className="root-cause-insufficient">
+                <div className="empty-state-icon">📋</div>
+                <h3 className="empty-state-title">Need More Data</h3>
+                <p className="empty-state-description">{actionPlan.data_sufficiency_note}</p>
+              </div>
+            ) : (
+              <>
+                {/* Pending tasks */}
+                <div className="action-task-list">
+                  {actionPlan?.pending?.length > 0 ? (
+                    actionPlan.pending.map((task) => (
+                      <div key={task.task_id} className={`action-task-item priority-${task.priority.toLowerCase()}`}>
+                        <button
+                          className="action-task-checkbox"
+                          onClick={() => handleCompleteTask(task.task_id)}
+                          disabled={completingTaskId === task.task_id}
+                          title="Mark complete"
+                          aria-label={`Mark "${task.title}" as complete`}
+                        >
+                          {completingTaskId === task.task_id
+                            ? <span className="action-task-spinner" />
+                            : <Circle size={20} />
+                          }
+                        </button>
+                        <div className="action-task-body">
+                          <div className="action-task-header">
+                            <h3 className="action-task-title">{task.title}</h3>
+                            <span className={`action-priority-badge priority-badge-${task.priority.toLowerCase()}`}>{task.priority}</span>
+                          </div>
+                          <p className="action-task-benefit">{task.expected_benefit}</p>
+                          <div className="action-task-meta">
+                            <div className="action-task-metrics">
+                              <div className="metric-item">
+                                <span className="metric-label">Profit at risk</span>
+                                <span className="metric-value">{formatCurrency(task.profit_risk)}</span>
+                              </div>
+                              <div className="metric-item">
+                                <span className="metric-label">Expected saving</span>
+                                <span className="metric-value recovery">{formatCurrency(task.expected_saving)}</span>
+                              </div>
+                            </div>
+                            <div className="action-task-tags">
+                              <span className="action-task-tag">
+                                <Clock size={11} />
+                                {task.estimated_time}
+                              </span>
+                              <span className="action-task-tag">
+                                {task.difficulty}
+                              </span>
+                              <span className="confidence-tag">
+                                {Math.round(task.confidence * 100)}% confidence
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="action-planner-all-done">
+                      <CheckCircle2 size={32} className="all-done-icon" />
+                      <p>All tasks complete — great work today!</p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Completed tasks — collapsible */}
+                {actionPlan?.completed?.length > 0 && (
+                  <div className="action-completed-section">
+                    <button
+                      className="action-completed-toggle"
+                      onClick={() => setShowCompleted(v => !v)}
+                    >
+                      {showCompleted ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                      {showCompleted ? 'Hide' : 'Show'} completed ({actionPlan.completed.length})
+                    </button>
+                    {showCompleted && (
+                      <div className="action-task-list action-completed-list">
+                        {actionPlan.completed.map((task) => (
+                          <div key={task.task_id} className="action-task-item action-task-done">
+                            <button
+                              className="action-task-checkbox done"
+                              onClick={() => handleReopenTask(task.task_id)}
+                              disabled={completingTaskId === task.task_id}
+                              title="Mark as not done"
+                              aria-label={`Reopen "${task.title}"`}
+                            >
+                              {completingTaskId === task.task_id
+                                ? <span className="action-task-spinner" />
+                                : <CheckCircle2 size={20} />
+                              }
+                            </button>
+                            <div className="action-task-body">
+                              <div className="action-task-header">
+                                <h3 className="action-task-title done">{task.title}</h3>
+                                <span className={`action-priority-badge priority-badge-${task.priority.toLowerCase()} done`}>{task.priority}</span>
+                              </div>
+                              {task.completed_at && (
+                                <p className="action-task-completed-at">
+                                  Completed {new Date(task.completed_at).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}
+                                </p>
+                              )}
+                              <div className="action-task-tags">
+                                <span className="action-task-tag">
+                                  {formatCurrency(task.expected_saving)} saved
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
             )}
           </section>
         </>
