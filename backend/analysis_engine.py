@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import numpy as np
@@ -32,15 +34,126 @@ def to_native(obj):
         return obj
 
 
+def capture_daily_snapshot():
+    config_path = os.path.join(os.path.dirname(__file__), "data_source_config.json")
+    if not os.path.exists(config_path):
+        return
+
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    except Exception:
+        return
+
+    if config.get("mode") != "live":
+        return
+
+    live_sales_path = config.get("sales_path")
+    if not live_sales_path or not os.path.exists(live_sales_path):
+        return
+
+    live_mtime = os.path.getmtime(live_sales_path)
+    last_captured_mtime = config.get("last_captured_mtime", 0.0)
+
+    if live_mtime > last_captured_mtime:
+        try:
+            if live_sales_path.lower().endswith(('.xlsx', '.xls')):
+                live_df = pd.read_excel(live_sales_path, engine='openpyxl')
+            else:
+                live_df = pd.read_csv(live_sales_path)
+
+            required_cols = ["product", "units_sold", "revenue", "profit"]
+            if not all(col in live_df.columns for col in required_cols):
+                logger.error("Live sales file is missing required columns during snapshot capture.")
+                return
+
+            live_df = live_df[required_cols].copy()
+            today_str = datetime.date.today().strftime("%Y-%m-%d")
+            live_df["date"] = today_str
+            live_df = live_df[["date", "product", "units_sold", "revenue", "profit"]]
+
+            acc_path = os.path.join(os.path.dirname(__file__), "accumulated_sales_data.csv")
+            if os.path.exists(acc_path) and os.path.getsize(acc_path) > 0:
+                try:
+                    acc_df = pd.read_csv(acc_path)
+                except Exception:
+                    acc_df = pd.DataFrame(columns=["date", "product", "units_sold", "revenue", "profit"])
+            else:
+                acc_df = pd.DataFrame(columns=["date", "product", "units_sold", "revenue", "profit"])
+
+            if not acc_df.empty:
+                # Upsert: remove today's entries matching products in live_df
+                mask = (acc_df["date"] == today_str) & (acc_df["product"].isin(live_df["product"]))
+                acc_df = acc_df[~mask]
+
+            new_acc_df = pd.concat([acc_df, live_df], ignore_index=True)
+            new_acc_df.to_csv(acc_path, index=False)
+
+            config["last_captured_mtime"] = live_mtime
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2)
+
+            logger.info(f"Captured sales snapshot for {today_str} (mtime: {live_mtime})")
+        except Exception as e:
+            logger.error(f"Failed to capture daily snapshot: {e}")
+
+
 def load_data():
-    sales = pd.read_csv("sales_data.csv")
-    inventory = pd.read_csv("inventory_data.csv")
+    config_path = os.path.join(os.path.dirname(__file__), "data_source_config.json")
+    mode = "demo"
+    sales_path = "demo_sales_data.csv"
+    inventory_path = "demo_inventory_data.csv"
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                mode = config.get("mode", "demo")
+                if mode == "uploaded":
+                    sales_path = config.get("sales_path") or "sales_data.csv"
+                    inventory_path = config.get("inventory_path") or "inventory_data.csv"
+                elif mode == "live":
+                    # Pre-create empty accumulated file if it doesn't exist
+                    acc_path = os.path.join(os.path.dirname(__file__), "accumulated_sales_data.csv")
+                    if not os.path.exists(acc_path):
+                        df = pd.DataFrame(columns=["date", "product", "units_sold", "revenue", "profit"])
+                        df.to_csv(acc_path, index=False)
+
+                    capture_daily_snapshot()
+                    sales_path = acc_path
+                    inventory_path = config.get("inventory_path")
+        except Exception as e:
+            logger.error(f"Failed to read data_source_config.json: {e}")
+
+    # Fallbacks if path is empty or file doesn't exist
+    if not sales_path or not os.path.exists(sales_path):
+        sales_path = "demo_sales_data.csv"
+    if not inventory_path or not os.path.exists(inventory_path):
+        inventory_path = "demo_inventory_data.csv"
+
+    def read_file(path: str) -> pd.DataFrame:
+        if path.lower().endswith(('.xlsx', '.xls')):
+            return pd.read_excel(path, engine='openpyxl')
+        else:
+            return pd.read_csv(path)
+
+    sales = read_file(sales_path)
+    inventory = read_file(inventory_path)
     sales["date"] = pd.to_datetime(sales["date"])
     return sales, inventory
 
 
+
 def analyze_profit_drop(sales: pd.DataFrame):
     """Compares last 15 days vs previous 15 days to find what's driving any profit change."""
+    if sales.empty or sales["date"].dt.date.nunique() < 15:
+        return {
+            "total_profit_change": 0.0,
+            "summary": "Still learning your business — check back after a few more days of data (at least 15 days) to see profit trends.",
+            "top_drivers": [],
+            "insufficient_data": True
+        }
+
     max_date = sales["date"].max()
     recent_start = max_date - pd.Timedelta(days=14)
     prev_start = max_date - pd.Timedelta(days=29)
@@ -276,6 +389,14 @@ def calculate_health_score(profit_analysis: dict, priority_actions: list, anomal
     every point lost traces back to a specific, real reason — this is
     what makes the score trustworthy rather than a vague vibe.
     """
+    if profit_analysis.get("insufficient_data"):
+        return {
+            "score": 100.0,
+            "label": "Pending",
+            "breakdown": ["Health score calculations are pending. Awaiting at least 15 days of store history."],
+            "insufficient_data": True
+        }
+
     score = 100.0
     reasons = []
 
@@ -410,6 +531,17 @@ def forecast_next_period_profit(sales: pd.DataFrame, days_back: int = 30, days_f
     (ARIMA/Prophet) since the demo needs speed and a defensible "why"
     behind the number, not marginal accuracy gains.
     """
+    if sales.empty or sales["date"].dt.date.nunique() < 15:
+        return {
+            "forecast_period_days": days_forward,
+            "forecast_total": 0.0,
+            "forecast_daily_avg": 0.0,
+            "trend_direction": "flat",
+            "trend_slope_per_day": 0.0,
+            "reasoning": "Still learning your business — check back after a few more days of data (at least 15 days) to see profit forecasts.",
+            "insufficient_data": True
+        }
+
     max_date = sales["date"].max()
     start_date = max_date - pd.Timedelta(days=days_back - 1)
     recent = sales[sales["date"] >= start_date]
@@ -459,63 +591,29 @@ def forecast_next_period_profit(sales: pd.DataFrame, days_back: int = 30, days_f
     }
 
 
-def generate_executive_summary(sales: pd.DataFrame, inventory: pd.DataFrame) -> dict:
-    """
-    Produces the 'board meeting opening' — a short, high-conviction LLM
-    narrative that ties together health score, top priority actions,
-    critical anomalies, and the forward-looking forecast into the exact
-    2-paragraph summary an owner would want read aloud before a meeting.
+def _extract_top_risk(priority_actions: list, anomalies: list, profit: dict) -> str:
+    critical = [a for a in anomalies if a["severity"] == "critical"]
+    if critical:
+        return critical[0]["message"]
+    if priority_actions:
+        top = priority_actions[0]
+        return f"{top['product']}: {top['recommended_action']} (Rs {top['impact_rupees']:,.0f} impact)"
+    if profit.get("top_drivers"):
+        d = profit["top_drivers"][0]
+        return f"{d['product']} profit dropped Rs {abs(d['profit_change']):,.0f} in the last 15 days"
+    return "No critical risks flagged — business metrics are within normal range."
 
-    Unlike ask_question (reactive — answers whatever's asked), this is
-    proactive: always freshly generated from current data, with a fixed
-    structure (state of business -> biggest risk/opportunity -> first
-    move) so it reads consistently regardless of what the LLM emphasizes.
 
-    Falls back to a deterministic templated summary if the LLM call
-    fails for any reason — this is a demo centerpiece, so it must never
-    show a blank error on stage.
-    """
-    profit = analyze_profit_drop(sales)
-    priority_actions = get_priority_actions(sales, inventory)
-    anomalies = detect_anomalies(sales, inventory)
-    health = calculate_health_score(profit, priority_actions, anomalies)
-    forecast = forecast_next_period_profit(sales)
+def _extract_top_opportunity(anomalies: list) -> str:
+    opportunities = [a for a in anomalies if a["severity"] == "opportunity"]
+    if opportunities:
+        return opportunities[0]["message"]
+    return "No major demand spikes detected — focus on protecting margins and stock levels."
 
-    context = {
-        "health_score": health,
-        "profit_analysis": profit,
-        "top_priority_actions": priority_actions[:3],
-        "critical_anomalies": [a for a in anomalies if a["severity"] == "critical"],
-        "forecast_next_period": forecast,
-    }
-    native_context = to_native(context)
 
-    fallback_summary = (
-        f"Business health is {health['label']} at {health['score']}/100. "
-        f"{profit['summary']} "
-        + (f"Top priority: {priority_actions[0]['recommended_action']} " if priority_actions else "")
-        + forecast.get("reasoning", "")
-    )
-
+def _call_groq_narrative(system_prompt: str, user_prompt: str = "Open the meeting.", max_tokens: int = 350) -> str | None:
     if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY not set — returning fallback executive summary.")
-        return {"summary": fallback_summary, "generated_by": "fallback", "context": native_context}
-
-    system_prompt = (
-        "You are 'AI Business Doctor', opening a board meeting for a small Indian "
-        "kirana/retail store owner. Write a short, confident, 2-paragraph executive "
-        "summary using ONLY the JSON data provided below.\n\n"
-        "Paragraph 1: State overall business health (cite the score and label) and the "
-        "single biggest driver of that score, in plain conversational language.\n"
-        "Paragraph 2: State the ONE most important action to take first (from "
-        "top_priority_actions), the projected profit outlook (from forecast_next_period), "
-        "and end with a clear, confident recommendation.\n\n"
-        "Rules: Cite real Rs figures and product names. No bullet points, no headers, no "
-        "markdown — write it as something a person would say out loud opening a meeting. "
-        "Keep it under 130 words total.\n\n"
-        f"DATA:\n{json.dumps(native_context, default=str)}"
-    )
-
+        return None
     try:
         response = requests.post(
             GROQ_URL,
@@ -527,23 +625,257 @@ def generate_executive_summary(sales: pd.DataFrame, inventory: pd.DataFrame) -> 
                 "model": GROQ_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Open the meeting."},
+                    {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.5,
-                "max_tokens": 300,
+                "max_tokens": max_tokens,
             },
-            timeout=10,
+            timeout=15,
         )
         response.raise_for_status()
         data = response.json()
-        summary_text = data["choices"][0]["message"]["content"].strip()
-        return {"summary": summary_text, "generated_by": "llm", "context": native_context}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Groq API request failed during executive summary: {e}")
-        return {"summary": fallback_summary, "generated_by": "fallback", "context": native_context}
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        logger.error(f"Unexpected Groq response format during executive summary: {e}")
-        return {"summary": fallback_summary, "generated_by": "fallback", "context": native_context}
+        return data["choices"][0]["message"]["content"].strip()
+    except (requests.exceptions.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
+        logger.error(f"Groq API call failed: {e}")
+        return None
+
+
+def get_executive_summary(sales: pd.DataFrame, inventory: pd.DataFrame) -> dict:
+    """
+    Board-meeting opening narrative combining health score, priority actions,
+    anomaly alerts, and a 15-day profit forecast. Returns structured fields
+    plus an LLM-written narrative with deterministic fallback.
+    """
+    if sales.empty or sales["date"].dt.date.nunique() < 15:
+        return {
+            "narrative": "Good afternoon. We are currently in learning mode. AI Business Doctor is building a history from your daily updates. Please continue updating your sales data. Once 15 days of history are accumulated, we will generate your board narrative and forecast.",
+            "health_score": 100.0,
+            "health_label": "Pending",
+            "profit_forecast_next_15_days": 0.0,
+            "top_risk": "Insufficient history (less than 15 days)",
+            "top_opportunity": "Data accumulation in progress",
+            "generated_by": "fallback",
+            "context": {},
+            "insufficient_data": True
+        }
+
+    profit = analyze_profit_drop(sales)
+    priority_actions = get_priority_actions(sales, inventory)
+    anomalies = detect_anomalies(sales, inventory)
+    health = calculate_health_score(profit, priority_actions, anomalies)
+    forecast = forecast_next_period_profit(sales)
+
+    top_risk = _extract_top_risk(priority_actions, anomalies, profit)
+    top_opportunity = _extract_top_opportunity(anomalies)
+    profit_forecast = forecast["forecast_total"]
+
+    context = {
+        "health_score": health,
+        "profit_analysis": profit,
+        "top_priority_actions": priority_actions[:3],
+        "anomaly_alerts": anomalies,
+        "forecast_next_period": forecast,
+        "top_risk": top_risk,
+        "top_opportunity": top_opportunity,
+    }
+    native_context = to_native(context)
+
+    top_action = priority_actions[0]["recommended_action"] if priority_actions else "maintain current operations"
+    fallback_narrative = (
+        f"Good afternoon. Here's today's business review. "
+        f"Your business health score is {health['score']}/100 ({health['label']}). "
+        f"{profit['summary']} "
+        f"The single biggest risk right now: {top_risk} "
+        f"Top opportunity: {top_opportunity} "
+        f"Profit forecast for the next 15 days is approximately Rs {profit_forecast:,.0f} "
+        f"({forecast['trend_direction']} trend). "
+        f"The one action that matters most today: {top_action}."
+    )
+
+    system_prompt = (
+        "You are 'AI Business Doctor', opening a business review meeting for a small Indian "
+        "kirana/retail store owner. Write a confident 4-6 sentence executive summary using "
+        "ONLY the JSON data provided below.\n\n"
+        "Start with: 'Good afternoon. Here's today's business review.'\n"
+        "Then cover in order: current health (cite score and label), the single biggest risk, "
+        "the top opportunity if any, the 15-day profit forecast (cite Rs figure), and the "
+        "one action that matters most today.\n\n"
+        "Rules: Cite real Rs figures and product names. No bullet points, no headers, no "
+        "markdown — write it as spoken prose. Keep it under 160 words.\n\n"
+        f"DATA:\n{json.dumps(native_context, default=str)}"
+    )
+
+    narrative = _call_groq_narrative(system_prompt)
+    generated_by = "llm" if narrative else "fallback"
+    if not narrative:
+        if not GROQ_API_KEY:
+            logger.warning("GROQ_API_KEY not set — returning fallback executive summary.")
+        narrative = fallback_narrative
+
+    return {
+        "narrative": narrative,
+        "health_score": health["score"],
+        "health_label": health["label"],
+        "profit_forecast_next_15_days": profit_forecast,
+        "top_risk": top_risk,
+        "top_opportunity": top_opportunity,
+        "generated_by": generated_by,
+        "context": native_context,
+    }
+
+
+def generate_executive_summary(sales: pd.DataFrame, inventory: pd.DataFrame) -> dict:
+    """Backward-compatible wrapper used by get_all_insights and PDF export."""
+    result = get_executive_summary(sales, inventory)
+    return {
+        "summary": result["narrative"],
+        "generated_by": result["generated_by"],
+        "context": result["context"],
+        "insufficient_data": result.get("insufficient_data")
+    }
+
+
+def simulate_scenario(product: str, demand_change_pct: float) -> dict:
+    """
+    Re-runs reorder and profit projections assuming a product's daily demand
+    shifts by the given percentage.
+    """
+    sales, inventory = load_data()
+
+    inv_row = inventory[inventory["product"] == product]
+    if inv_row.empty:
+        raise ValueError(f"Product '{product}' not found in inventory.")
+
+    current_stock = int(inv_row["current_stock"].values[0])
+
+    max_date = sales["date"].max()
+    recent_start = max_date - pd.Timedelta(days=14)
+    recent = sales[(sales["date"] >= recent_start) & (sales["product"] == product)]
+    baseline_daily = float(recent["units_sold"].sum() / 15) if not recent.empty else 0.0
+
+    multiplier = 1 + (demand_change_pct / 100)
+    adjusted_daily = baseline_daily * multiplier
+
+    baseline_days = current_stock / baseline_daily if baseline_daily > 0 else 999.0
+    projected_days = current_stock / adjusted_daily if adjusted_daily > 0 else 999.0
+
+    product_sales = sales[sales["product"] == product]
+    total_units = product_sales["units_sold"].sum()
+    ppu = float(product_sales["profit"].sum() / total_units) if total_units > 0 else 0.0
+
+    daily_profit_delta = (adjusted_daily - baseline_daily) * ppu
+    projected_profit_impact = round(daily_profit_delta * 7, 2)
+
+    if demand_change_pct > 0:
+        if projected_days <= 7:
+            reorder_qty = max(1, int(adjusted_daily * 7))
+            recommended_action = (
+                f"Demand up {demand_change_pct:.0f}% — stock falls to {projected_days:.1f} days. "
+                f"Reorder ~{reorder_qty} units of {product} immediately to avoid stockout."
+            )
+        else:
+            recommended_action = (
+                f"Demand up {demand_change_pct:.0f}% — adds ~Rs {projected_profit_impact:,.0f} profit "
+                f"over 7 days. Stock still covers {projected_days:.1f} days; monitor weekly."
+            )
+    elif demand_change_pct < 0:
+        if projected_days >= 45:
+            recommended_action = (
+                f"Demand down {abs(demand_change_pct):.0f}% — stock stretches to {projected_days:.0f} days. "
+                f"Pause reorders on {product} and consider a promotion to free capital."
+            )
+        else:
+            recommended_action = (
+                f"Demand down {abs(demand_change_pct):.0f}% — projected profit impact "
+                f"Rs {projected_profit_impact:,.0f} over 7 days. Adjust reorder quantities accordingly."
+            )
+    else:
+        recommended_action = f"No demand change assumed for {product} — baseline scenario holds."
+
+    return {
+        "product": product,
+        "demand_change_pct": demand_change_pct,
+        "baseline_days_of_stock_left": round(baseline_days, 1),
+        "projected_days_of_stock_left": round(projected_days, 1),
+        "projected_profit_impact": projected_profit_impact,
+        "recommended_action": recommended_action,
+    }
+
+
+def _advisor_prompt(role: str, lens: str, context_json: str) -> str:
+    return (
+        f"You are a {role} advisor on a panel reviewing a small Indian kirana/retail store. "
+        f"Give a 2-3 sentence take from a {lens} perspective using ONLY the JSON data below. "
+        f"Cite real Rs figures and product names. Be direct and professional — no bullet points, "
+        f"no markdown.\n\nDATA:\n{context_json}"
+    )
+
+
+def get_advisor_panel(sales: pd.DataFrame, inventory: pd.DataFrame) -> dict:
+    """
+    Calls Groq three times (Finance, Operations, Marketing) with the same
+    business context, running requests concurrently via thread pool.
+    """
+    profit = analyze_profit_drop(sales)
+    priority_actions = get_priority_actions(sales, inventory)
+    anomalies = detect_anomalies(sales, inventory)
+    health = calculate_health_score(profit, priority_actions, anomalies)
+    forecast = forecast_next_period_profit(sales)
+
+    context = to_native({
+        "health_score": health,
+        "profit_analysis": profit,
+        "top_priority_actions": priority_actions[:5],
+        "anomaly_alerts": anomalies,
+        "forecast_next_period": forecast,
+        "stop_selling": recommend_stop_selling(sales, inventory),
+        "reorder": recommend_reorder(sales, inventory),
+    })
+    context_json = json.dumps(context, default=str)
+
+    advisors = [
+        ("finance_take", "Finance", "cash flow, margins, capital tied up in stock, and profit risk"),
+        ("operations_take", "Operations", "inventory levels, reorder timing, stockouts, and supply chain"),
+        ("marketing_take", "Marketing", "demand trends, promotions, product mix, and growth opportunities"),
+    ]
+
+    fallbacks = {
+        "finance_take": (
+            f"From a finance lens: health is {health['score']}/100 ({health['label']}). "
+            f"15-day profit change is Rs {profit['total_profit_change']:,.0f}. "
+            f"Next 15 days forecast ~Rs {forecast['forecast_total']:,.0f}."
+        ),
+        "operations_take": (
+            f"Operations view: {len(recommend_reorder(sales, inventory))} products need urgent reorder. "
+            + (f"Top priority — {priority_actions[0]['recommended_action']}" if priority_actions else "No urgent ops actions.")
+        ),
+        "marketing_take": (
+            f"Marketing view: {len([a for a in anomalies if a['severity'] == 'opportunity'])} demand opportunities detected. "
+            + (anomalies[0]["message"] if anomalies else "Focus on core sellers and margin protection.")
+        ),
+    }
+
+    results = {}
+
+    def _fetch_take(key, role, lens):
+        prompt = _advisor_prompt(role, lens, context_json)
+        text = _call_groq_narrative(prompt, user_prompt="Give your professional take.", max_tokens=200)
+        return key, text or fallbacks[key]
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(_fetch_take, key, role, lens): key
+            for key, role, lens in advisors
+        }
+        for future in as_completed(futures):
+            key, text = future.result()
+            results[key] = text
+
+    return {
+        "finance_take": results.get("finance_take", fallbacks["finance_take"]),
+        "operations_take": results.get("operations_take", fallbacks["operations_take"]),
+        "marketing_take": results.get("marketing_take", fallbacks["marketing_take"]),
+    }
 
 
 def build_llm_context(sales: pd.DataFrame, inventory: pd.DataFrame) -> str:
@@ -758,6 +1090,8 @@ def ask_question(question: str, history: list | None = None):
 
 def get_all_insights():
     sales, inventory = load_data()
+    insufficient_data = sales.empty or sales["date"].dt.date.nunique() < 15
+    
     result = {
         "profit_analysis": analyze_profit_drop(sales),
         "stop_selling": recommend_stop_selling(sales, inventory),
@@ -771,6 +1105,7 @@ def get_all_insights():
         result["profit_analysis"], result["priority_actions"], result["anomaly_alerts"]
     )
     result["executive_summary"] = generate_executive_summary(sales, inventory)
+    result["insufficient_data"] = insufficient_data
     return to_native(result)
 
 

@@ -1,0 +1,8 @@
+{
+  "mode": "uploaded",
+  "sales_path": "sales_data.xlsx",
+  "inventory_path": "inventory_data.xlsx",
+  "uploaded_sales_path": "sales_data.xlsx",
+  "uploaded_inventory_path": "inventory_data.xlsx",
+  "last_captured_mtime": 1784091182.718413
+}
