@@ -2812,3 +2812,155 @@ body {
     font-size: 26px;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   AI INVENTORY OPTIMIZER — Purchase Planner section
+   Sits below the existing Stop-Selling & Reorder section.
+   Reuses .metric-item/.metric-label/.metric-value/.severity-tag
+   from the Root Cause section — no new colour tokens.
+════════════════════════════════════════════════════════════════ */
+
+.inv-optimizer-section {
+  margin-top: 24px;
+  margin-bottom: 28px;
+}
+
+/* Totals row in the section header */
+.inv-optimizer-totals {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.inv-total-pill {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 8px 14px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+}
+
+.inv-total-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-muted);
+}
+
+.inv-total-value {
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.1;
+}
+.inv-total-value.spend  { color: var(--warning); }
+.inv-total-value.savings { color: var(--accent); }
+
+/* Meta line below the header */
+.inv-optimizer-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 18px;
+  line-height: 1.5;
+}
+
+/* List of product cards */
+.inv-optimizer-list {
+  display: grid;
+  gap: 14px;
+}
+
+/* Individual product card */
+.inv-optimizer-item {
+  padding: 18px 20px;
+  background: var(--bg-inset);
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  transition: border-color var(--transition);
+}
+.inv-optimizer-item:hover {
+  border-color: var(--border);
+}
+
+/* Header: product name + coverage badge + savings badge */
+.inv-optimizer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.inv-optimizer-title-group {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.inv-optimizer-product {
+  font-family: var(--serif);
+  font-size: 17px;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+/* Savings badge — teal accent, mirrors action-planner-savings-badge */
+.inv-optimizer-savings-badge {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-glow);
+  border-radius: 16px;
+  padding: 4px 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Metrics grid — 3 columns, reuses existing metric-item classes */
+.inv-optimizer-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 12px;
+}
+
+/* Inline note for missing safety stock data */
+.inv-optimizer-note {
+  font-size: 11px;
+  color: var(--warning);
+  background: rgba(212, 168, 67, 0.07);
+  border: 1px solid rgba(212, 168, 67, 0.2);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+/* Responsive: collapse to 2-col then 1-col on small screens */
+@media (max-width: 640px) {
+  .inv-optimizer-metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .inv-optimizer-totals {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .inv-total-pill {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 420px) {
+  .inv-optimizer-metrics {
+    grid-template-columns: 1fr;
+  }
+}

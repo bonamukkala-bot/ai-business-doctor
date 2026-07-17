@@ -2068,6 +2068,243 @@ def predict_cash_flow(user_id: str, authenticated_supabase_client) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AI INVENTORY OPTIMIZER
+# Wraps recommend_reorder() and enriches each result with safety stock,
+# coverage days, purchase quantity, cost, estimated savings, and a
+# plain-English explanation — all derived from real data.
+# recommend_reorder() is NOT modified; it remains the source of truth for
+# the existing /insights endpoint and every other caller.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Safety factor: z-score for ~85% service level (one-sided normal).
+# Industry standard for FMCG/retail with moderate demand variability.
+# Named constant so it's easy to tune without hunting the logic.
+INV_SAFETY_FACTOR = 1.04
+
+# Trailing window for demand and variability calculation — matches
+# CF_TRAILING_WINDOW_DAYS and the root-cause analysis window.
+INV_TRAILING_DAYS = 30
+
+# Minimum unique days of daily demand data required before we'll compute
+# a meaningful std-deviation for safety stock.
+INV_MIN_VARIABILITY_DAYS = 7
+
+# Target coverage horizon used for purchase quantity calculation (days).
+# "Buy enough to cover the next 14 days" is the planning horizon.
+INV_COVERAGE_TARGET_DAYS = 14
+
+
+def get_inventory_optimizer(user_id: str, authenticated_supabase_client) -> dict:
+    """
+    Upgrade of the reorder recommendation into a full per-product optimizer.
+
+    WHAT recommend_reorder() ALREADY CALCULATED (unchanged):
+    - daily_avg: units_sold over last 14 days / 15  (demand proxy)
+    - days_of_stock_left: current_stock / daily_avg
+    - projected_7day_need: daily_avg × 7  (used as recommended_reorder_qty)
+    - Only returns products with days_of_stock_left ≤ 7 (urgent filter)
+
+    WHAT THIS FUNCTION ADDS:
+    - Covers ALL inventory products, not just the urgent ones, so the owner
+      sees a complete purchase-planning picture.
+    - expected_demand: daily_avg × INV_COVERAGE_TARGET_DAYS  (consistent
+      with the existing demand average — not a new calculation method)
+    - safety_stock: INV_SAFETY_FACTOR × σ(daily units) × √(lead_time_days)
+      where σ is the std-dev of daily sales over the trailing INV_TRAILING_DAYS
+      window, and lead_time_days = 1 (same-day or next-day supplier for typical
+      kirana/FMCG). If fewer than INV_MIN_VARIABILITY_DAYS of daily data exist
+      for a product, safety_stock is marked as None with an explanation.
+    - stock_coverage_days: current_stock / daily_avg  (same formula as
+      recommend_reorder, unified source)
+    - recommended_purchase_qty: max(0, expected_demand + safety_stock − current_stock)
+    - estimated_cost: recommended_purchase_qty × unit_cost  (from inventory data)
+    - estimated_savings: lost profit avoided by not stocking out.
+      Calculated as: daily_avg × profit_per_unit × days_until_stockout,
+      only when days_until_stockout < INV_COVERAGE_TARGET_DAYS (i.e. there is
+      actually a stockout risk). Returns 0 for products already well-stocked —
+      no fabricated savings for healthy products.
+    - explanation: plain-English string built from the actual computed numbers.
+    """
+    sales, inventory = load_data(user_id)
+
+    unique_days = int(sales["date"].dt.date.nunique()) if not sales.empty else 0
+
+    if sales.empty or unique_days < 7:
+        return {
+            "insufficient_data": True,
+            "data_sufficiency_note": (
+                f"Need at least 7 days of sales history for inventory optimization. "
+                f"Currently have {unique_days} day(s)."
+            ),
+            "items": [],
+            "total_recommended_spend": 0.0,
+            "total_estimated_savings": 0.0,
+        }
+
+    max_date = sales["date"].max()
+    trailing_start = max_date - pd.Timedelta(days=INV_TRAILING_DAYS - 1)
+    trailing_sales = sales[sales["date"] >= trailing_start].copy()
+
+    # ── Per-product daily demand stats over trailing window ───────────────
+    # Group by date+product to get true daily granularity for std-dev
+    daily_by_product = (
+        trailing_sales.groupby(["date", "product"])["units_sold"]
+        .sum()
+        .reset_index()
+    )
+
+    demand_stats = (
+        daily_by_product.groupby("product")["units_sold"]
+        .agg(
+            demand_mean="mean",
+            demand_std="std",
+            demand_days="count",
+        )
+        .reset_index()
+    )
+
+    # Per-product profit per unit (used for estimated_savings)
+    profit_per_unit = (
+        trailing_sales.groupby("product")
+        .apply(
+            lambda g: (
+                g["profit"].sum() / g["units_sold"].sum()
+                if g["units_sold"].sum() > 0 else 0.0
+            )
+        )
+        .reset_index(name="profit_per_unit")
+    )
+
+    # Merge everything onto inventory
+    merged = inventory.copy()
+    merged = merged.merge(demand_stats, on="product", how="left")
+    merged = merged.merge(profit_per_unit, on="product", how="left")
+    merged["demand_mean"] = merged["demand_mean"].fillna(0.0)
+    merged["demand_std"] = merged["demand_std"].fillna(0.0)
+    merged["demand_days"] = merged["demand_days"].fillna(0).astype(int)
+    merged["profit_per_unit"] = merged["profit_per_unit"].fillna(0.0)
+
+    items = []
+    for _, row in merged.iterrows():
+        product = row["product"]
+        current_stock = int(row["current_stock"])
+        unit_cost = float(row["unit_cost"])
+        daily_avg = float(row["demand_mean"])
+        demand_std = float(row["demand_std"])
+        demand_days = int(row["demand_days"])
+        ppu = float(row["profit_per_unit"])
+
+        # ── Coverage days ─────────────────────────────────────────────────
+        if daily_avg > 0:
+            stock_coverage_days = round(current_stock / daily_avg, 1)
+        else:
+            stock_coverage_days = 999.0  # no demand = infinite coverage
+
+        # ── Expected demand over planning horizon ─────────────────────────
+        expected_demand = round(daily_avg * INV_COVERAGE_TARGET_DAYS, 1)
+
+        # ── Safety stock ──────────────────────────────────────────────────
+        # Formula: z × σ_daily × √(lead_time_days)
+        # lead_time_days = 1 (same/next-day resupply assumption for kirana)
+        # If not enough variability data, mark as None and explain why.
+        lead_time_days = 1
+        if demand_days >= INV_MIN_VARIABILITY_DAYS and pd.notna(demand_std):
+            safety_stock = round(
+                INV_SAFETY_FACTOR * demand_std * (lead_time_days ** 0.5), 1
+            )
+            safety_stock_note = None
+        else:
+            safety_stock = None
+            safety_stock_note = (
+                f"Only {demand_days} day(s) of sales data available in the last "
+                f"{INV_TRAILING_DAYS} days — need at least {INV_MIN_VARIABILITY_DAYS} "
+                f"to compute reliable demand variability. Safety stock set to 0 for "
+                f"purchase quantity calculation."
+            )
+
+        safety_stock_for_calc = safety_stock if safety_stock is not None else 0.0
+
+        # ── Recommended purchase quantity ─────────────────────────────────
+        need = expected_demand + safety_stock_for_calc - current_stock
+        recommended_purchase_qty = int(max(0, round(need)))
+
+        # ── Estimated cost ────────────────────────────────────────────────
+        estimated_cost = round(recommended_purchase_qty * unit_cost, 2)
+
+        # ── Estimated savings (only when real stockout risk exists) ───────
+        # Savings = profit that would be lost to a stockout before the next
+        # restock. Only calculated when coverage < planning horizon.
+        if daily_avg > 0 and stock_coverage_days < INV_COVERAGE_TARGET_DAYS:
+            days_at_risk = max(0.0, INV_COVERAGE_TARGET_DAYS - stock_coverage_days)
+            estimated_savings = round(daily_avg * ppu * days_at_risk, 2)
+        else:
+            estimated_savings = 0.0  # no stockout risk — no fabricated savings
+
+        # ── Plain-English explanation ──────────────────────────────────────
+        if daily_avg <= 0:
+            explanation = (
+                f"No sales recorded for {product} in the last {INV_TRAILING_DAYS} days. "
+                f"Current stock: {current_stock} units. No purchase recommended."
+            )
+        elif recommended_purchase_qty == 0:
+            explanation = (
+                f"{product}: selling ~{daily_avg:.1f} units/day, "
+                f"{current_stock} in stock ({stock_coverage_days:.0f} days of coverage). "
+                f"Stock is sufficient for the next {INV_COVERAGE_TARGET_DAYS} days — no purchase needed."
+            )
+        else:
+            ss_part = (
+                f"safety stock of {safety_stock:.0f} units (based on demand variability)"
+                if safety_stock is not None
+                else "safety stock not computed (insufficient variability data)"
+            )
+            explanation = (
+                f"{product}: expected demand of {expected_demand:.0f} units over "
+                f"the next {INV_COVERAGE_TARGET_DAYS} days at ~{daily_avg:.1f}/day, "
+                f"you have {current_stock} in stock ({stock_coverage_days:.0f} days of coverage). "
+                f"Adding {ss_part}. "
+                f"Recommending purchase of {recommended_purchase_qty} units "
+                f"(estimated cost: Rs {estimated_cost:,.0f})."
+            )
+            if estimated_savings > 0:
+                explanation += (
+                    f" Avoids ~Rs {estimated_savings:,.0f} in lost profit from a potential stockout."
+                )
+
+        items.append({
+            "product": product,
+            "current_stock": current_stock,
+            "daily_avg_demand": round(daily_avg, 2),
+            "stock_coverage_days": stock_coverage_days,
+            "expected_demand": expected_demand,
+            "safety_stock": safety_stock,
+            "safety_stock_note": safety_stock_note,
+            "recommended_purchase_qty": recommended_purchase_qty,
+            "unit_cost": round(unit_cost, 2),
+            "estimated_cost": estimated_cost,
+            "estimated_savings": estimated_savings,
+            "explanation": explanation,
+        })
+
+    # Sort: highest estimated_savings first, then by coverage days ascending
+    items.sort(key=lambda x: (-x["estimated_savings"], x["stock_coverage_days"]))
+
+    total_recommended_spend = round(sum(i["estimated_cost"] for i in items), 2)
+    total_estimated_savings = round(sum(i["estimated_savings"] for i in items), 2)
+
+    return {
+        "insufficient_data": False,
+        "data_sufficiency_note": None,
+        "items": items,
+        "total_recommended_spend": total_recommended_spend,
+        "total_estimated_savings": total_estimated_savings,
+        "trailing_days": min(unique_days, INV_TRAILING_DAYS),
+        "coverage_target_days": INV_COVERAGE_TARGET_DAYS,
+        "safety_factor": INV_SAFETY_FACTOR,
+    }
+
+
 if __name__ == "__main__":
     import json
     insights = get_all_insights(user_id=1)

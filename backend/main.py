@@ -38,6 +38,7 @@ from analysis_engine import (
     calculate_root_causes,
     generate_action_plan,
     predict_cash_flow,
+    get_inventory_optimizer,
 )
 from pdf_report import build_pdf_report
 
@@ -377,6 +378,32 @@ class CashFlowResponse(BaseModel):
     trailing_days: int | None = None
     confidence: float | None = None
     recommendations: List[CashFlowRecommendation]
+
+# ── Inventory Optimizer models ────────────────────────────────────────────────
+
+class InventoryOptimizerItem(BaseModel):
+    product: str
+    current_stock: int
+    daily_avg_demand: float
+    stock_coverage_days: float
+    expected_demand: float
+    safety_stock: float | None = None
+    safety_stock_note: str | None = None
+    recommended_purchase_qty: int
+    unit_cost: float
+    estimated_cost: float
+    estimated_savings: float
+    explanation: str
+
+class InventoryOptimizerResponse(BaseModel):
+    insufficient_data: bool = False
+    data_sufficiency_note: str | None = None
+    items: List[InventoryOptimizerItem]
+    total_recommended_spend: float
+    total_estimated_savings: float
+    trailing_days: int | None = None
+    coverage_target_days: int | None = None
+    safety_factor: float | None = None
 
 class AdvisorPanelResponse(BaseModel):
     finance_take: str
@@ -1307,6 +1334,38 @@ def get_cash_flow_prediction(current_user: auth.SupabaseUser = Depends(auth.get_
         raise HTTPException(
             status_code=500,
             detail="Something went wrong generating the cash flow prediction. Check server logs."
+        )
+
+
+# ── Inventory Optimizer endpoint ──────────────────────────────────────────────
+
+@app.get("/api/inventory-optimizer", response_model=InventoryOptimizerResponse)
+def get_inventory_optimizer_endpoint(
+    current_user: auth.SupabaseUser = Depends(auth.get_current_user)
+):
+    """
+    Returns per-product inventory optimization data: expected demand,
+    safety stock (based on real demand variability), coverage days,
+    recommended purchase quantity, estimated cost, and estimated savings
+    from avoiding stockouts.
+
+    Does NOT modify recommend_reorder() — that function and the /insights
+    endpoint remain unchanged. This endpoint enriches the data with
+    additional per-product calculations.
+    """
+    try:
+        result = get_inventory_optimizer(current_user.id, current_user.supabase)
+        return to_native(result)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="Business data files not found. Upload your data before running inventory optimization."
+        )
+    except Exception:
+        logger.exception("Unexpected error running inventory optimizer")
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong running the inventory optimizer. Check server logs."
         )
 
 

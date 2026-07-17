@@ -38,6 +38,10 @@ function App() {
   const [cashFlowLoading, setCashFlowLoading] = useState(true)
   const [cashFlowError, setCashFlowError] = useState(null)
 
+  const [inventoryOptimizer, setInventoryOptimizer] = useState(null)
+  const [inventoryOptimizerLoading, setInventoryOptimizerLoading] = useState(true)
+  const [inventoryOptimizerError, setInventoryOptimizerError] = useState(null)
+
   const [question, setQuestion] = useState('')
   const [chatHistory, setChatHistory] = useState([])
   const [asking, setAsking] = useState(false)
@@ -155,6 +159,17 @@ function App() {
       setCashFlowError('Cash flow prediction unavailable — check backend logs.')
     } finally {
       setCashFlowLoading(false)
+    }
+
+    setInventoryOptimizerLoading(true)
+    try {
+      const invOptRes = await axios.get(`${API_BASE_URL}/api/inventory-optimizer`)
+      setInventoryOptimizer(invOptRes.data)
+      setInventoryOptimizerError(null)
+    } catch (err) {
+      setInventoryOptimizerError('Inventory optimizer unavailable — check backend logs.')
+    } finally {
+      setInventoryOptimizerLoading(false)
     }
   }
 
@@ -527,7 +542,13 @@ function App() {
               path="inventory"
               element={
                 onboardingComplete ? (
-                  <InventoryPage stopSelling={stop_selling} reorder={reorder} />
+                  <InventoryPage
+                    stopSelling={stop_selling}
+                    reorder={reorder}
+                    inventoryOptimizer={inventoryOptimizer}
+                    inventoryOptimizerLoading={inventoryOptimizerLoading}
+                    inventoryOptimizerError={inventoryOptimizerError}
+                  />
                 ) : (
                   <Navigate to="/onboarding" replace />
                 )
