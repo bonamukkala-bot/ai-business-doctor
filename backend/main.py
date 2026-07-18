@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 import auth
-from supabase_client import supabase, supabase_client_initialized, supabase_init_error
+from supabase_client import supabase, supabase_admin, supabase_client_initialized, supabase_init_error
 
 from analysis_engine import (
     get_all_insights,
@@ -33,6 +33,7 @@ from analysis_engine import (
     GROQ_URL,
     GROQ_MODEL,
     get_daily_summary,
+    get_all_insights,
     send_daily_email,
     send_daily_whatsapp,
     calculate_root_causes,
@@ -44,6 +45,10 @@ from analysis_engine import (
 from pdf_report import build_pdf_report
 
 load_dotenv()
+from analysis_engine import (
+    # ... your existing imports stay exactly as they are ...
+    analyze_supplier_opportunities,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai_business_doctor")
@@ -102,7 +107,7 @@ def run_daily_report():
             logger.error("Supabase not initialized — skipping daily report")
             return
         
-        response = supabase.table("profiles").select("id, email, phone_number").execute()
+        response = supabase_admin.table("profiles").select("id, email, phone_number").execute()
         users = response.data
         if not users:
             logger.warning("No users found — skipping daily report")
@@ -118,6 +123,17 @@ def run_daily_report():
             try:
                 sales, inventory = load_data(user_id)
                 summary = get_daily_summary(sales, inventory)
+
+                try:
+                    insights = get_all_insights(user_id)
+                    summary["health_score"] = insights.get("health_score", {})
+                    summary["top_risk"] = insights.get("top_risk")
+                    summary["top_opportunity"] = insights.get("top_opportunity")
+                except Exception:
+                    logger.exception(f"Failed to fetch insights for user {user_id} — report will skip health data")
+                    summary["health_score"] = {}
+                    summary["top_risk"] = None
+                    summary["top_opportunity"] = None
                 
                 # Send email if we have email
                 if user_email:
@@ -436,6 +452,29 @@ class DeadInventoryResponse(BaseModel):
     total_capital_blocked: float
     threshold_days: int
     products_analyzed: int
+class SupplierComparisonItem(BaseModel):
+    product: str
+    is_demo_data: bool
+    data_source: str
+    current_supplier_cost: float
+    alternate_supplier_name: str
+    alternate_supplier_cost: float
+    price_difference: float
+    price_difference_pct: float
+    supplier_rating: float
+    monthly_units_basis: float
+    monthly_savings: float
+    annual_savings: float
+    confidence_note: str
+
+class SupplierIntelligenceResponse(BaseModel):
+    insufficient_data: bool = False
+    data_sufficiency_note: str | None = None
+    items: List[SupplierComparisonItem]
+    total_monthly_savings: float
+    total_annual_savings: float
+    is_demo_data: bool
+    demo_data_note: str | None = None
 
 class AdvisorPanelResponse(BaseModel):
     finance_take: str
@@ -1727,3 +1766,18 @@ def test_daily_report():
     except Exception as e:
         logger.exception("Test daily report failed")
         raise HTTPException(status_code=500, detail=f"Test failed: {str(e)}")
+@app.get("/api/supplier-intelligence", response_model=SupplierIntelligenceResponse)
+def get_supplier_intelligence(current_user: auth.SupabaseUser = Depends(auth.get_current_user)):
+    """
+    Returns a supplier cost comparison. NOTE: alternate supplier data is
+    demonstration/mock data — current costs are real, alternates are not.
+    """
+    try:
+        result = analyze_supplier_opportunities(current_user.id, current_user.supabase)
+        return result
+    except Exception:
+        logger.exception("Unexpected error while generating supplier intelligence")
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong generating supplier intelligence. Check server logs."
+        )

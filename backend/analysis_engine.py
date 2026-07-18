@@ -15,12 +15,13 @@ from twilio.rest import Client
 from dotenv import load_dotenv
 
 load_dotenv()
+from mock_supplier_data import get_supplier_comparison, calculate_supplier_savings
 
 logger = logging.getLogger("ai_business_doctor")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_MODEL = "openai/gpt-oss-20b"
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
@@ -1449,78 +1450,160 @@ def get_daily_summary(sales: pd.DataFrame, inventory: pd.DataFrame, test_date: d
 
 def send_daily_email(summary: dict, recipient_email: str) -> None:
     """
-    Sends daily summary email via Gmail SMTP
+    Sends daily summary email via Gmail SMTP, styled as an HTML business health briefing.
     """
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
         logger.warning("GMAIL_ADDRESS or GMAIL_APP_PASSWORD not set — skipping email")
         return
-    
-    subject = f"Daily Business Report - {summary['date']}"
-    
-    # Build body
-    body = f"Daily Business Report for {summary['date']}\n"
-    body += "=======================================\n\n"
-    body += f"Total Profit Today: Rs {summary['total_profit_today']:,.2f}\n\n"
-    
-    if summary['top_selling_items']:
-        body += "Top Selling Items:\n"
-        body += "-------------------\n"
-        for item in summary['top_selling_items'][:5]:  # Top 5
-            body += f"- {item['product']}: {item['units_sold']} units sold, Rs {item['revenue']:,.2f}\n"
-        body += "\n"
-    
-    if summary['restocked_items_today']:
-        body += "Items Restocked Today:\n"
-        body += "-----------------------\n"
-        for item in summary['restocked_items_today']:
-            body += f"- {item['product']}: {item['qty']} units\n"
+
+    health = summary.get("health_score") or {}
+    score = health.get("score")
+    label = health.get("label", "Pending")
+    top_risk = summary.get("top_risk")
+    top_opportunity = summary.get("top_opportunity")
+
+    subject = f"Your Business Pulse — {summary['date']}"
+    if score is not None:
+        subject = f"Business Pulse: {score}/100 ({label}) — {summary['date']}"
+
+    score_color = "#3DABA8"
+    if isinstance(score, (int, float)):
+        if score < 40:
+            score_color = "#E05252"
+        elif score < 70:
+            score_color = "#E0A852"
+
+    top_sellers_rows = ""
+    if summary["top_selling_items"]:
+        for item in summary["top_selling_items"][:5]:
+            top_sellers_rows += f"""
+            <tr>
+                <td style="padding:8px 12px;border-bottom:1px solid #2A2A2A;color:#E5E5E5;">{item['product']}</td>
+                <td style="padding:8px 12px;border-bottom:1px solid #2A2A2A;color:#E5E5E5;text-align:center;">{item['units_sold']}</td>
+                <td style="padding:8px 12px;border-bottom:1px solid #2A2A2A;color:#3DABA8;text-align:right;">Rs {item['revenue']:,.2f}</td>
+            </tr>"""
     else:
-        body += "No items restocked today.\n\n"
-    
-    # Create message
-    msg = MIMEMultipart()
+        top_sellers_rows = '<tr><td colspan="3" style="padding:12px;color:#999;">No sales recorded today.</td></tr>'
+
+    restocked_html = ""
+    if summary["restocked_items_today"]:
+        items = "".join(f"<li style='color:#E5E5E5;margin-bottom:4px;'>{i['product']} — {i['qty']} units</li>" for i in summary["restocked_items_today"])
+        restocked_html = f"<ul style='margin:8px 0;padding-left:20px;'>{items}</ul>"
+    else:
+        restocked_html = "<p style='color:#999;margin:8px 0;'>No restocks logged today.</p>"
+
+    risk_html = f"""
+    <div style="background:#1A1A1A;border-left:3px solid #E0A852;padding:12px 16px;margin:16px 0;border-radius:4px;">
+        <p style="margin:0;color:#E0A852;font-weight:600;font-size:13px;letter-spacing:0.5px;">⚠ TOP RISK</p>
+        <p style="margin:6px 0 0;color:#E5E5E5;font-size:14px;">{top_risk}</p>
+    </div>""" if top_risk else ""
+
+    opportunity_html = f"""
+    <div style="background:#1A1A1A;border-left:3px solid #3DABA8;padding:12px 16px;margin:16px 0;border-radius:4px;">
+        <p style="margin:0;color:#3DABA8;font-weight:600;font-size:13px;letter-spacing:0.5px;">↗ TOP OPPORTUNITY</p>
+        <p style="margin:6px 0 0;color:#E5E5E5;font-size:14px;">{top_opportunity}</p>
+    </div>""" if top_opportunity else ""
+
+    score_html = f"""
+    <div style="text-align:center;padding:20px 0;">
+        <div style="display:inline-block;width:90px;height:90px;border-radius:50%;border:4px solid {score_color};line-height:82px;font-size:26px;font-weight:700;color:{score_color};">
+            {int(score) if score is not None else "—"}
+        </div>
+        <p style="color:{score_color};font-weight:600;margin:10px 0 0;font-size:14px;letter-spacing:0.5px;">{label.upper()}</p>
+    </div>""" if score is not None else ""
+
+    html_body = f"""
+    <html>
+    <body style="margin:0;padding:0;background:#0F0F0F;font-family:'Segoe UI',Arial,sans-serif;">
+        <div style="max-width:520px;margin:0 auto;background:#141414;padding:28px;">
+            <p style="color:#3DABA8;font-size:13px;letter-spacing:2px;text-transform:uppercase;margin:0 0 4px;">AI Business Doctor</p>
+            <h1 style="color:#FFFFFF;font-size:20px;font-weight:500;margin:0 0 4px;">Daily Business Pulse</h1>
+            <p style="color:#888;font-size:13px;margin:0 0 8px;">{summary['date']}</p>
+
+            {score_html}
+
+            <div style="background:#1A1A1A;padding:16px;border-radius:6px;margin:16px 0;">
+                <p style="margin:0;color:#999;font-size:12px;letter-spacing:0.5px;">TOTAL PROFIT TODAY</p>
+                <p style="margin:6px 0 0;color:#FFFFFF;font-size:24px;font-weight:600;">Rs {summary['total_profit_today']:,.2f}</p>
+            </div>
+
+            {risk_html}
+            {opportunity_html}
+
+            <p style="color:#FFFFFF;font-size:14px;font-weight:600;margin:24px 0 8px;">Top Selling Items</p>
+            <table style="width:100%;border-collapse:collapse;">
+                {top_sellers_rows}
+            </table>
+
+            <p style="color:#FFFFFF;font-size:14px;font-weight:600;margin:24px 0 8px;">Restocked Today</p>
+            {restocked_html}
+
+            <p style="color:#555;font-size:11px;margin-top:32px;border-top:1px solid #2A2A2A;padding-top:16px;">
+                Your business has a pulse. We help you read it. — AI Business Doctor
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+
+    msg = MIMEMultipart('alternative')
     msg['From'] = GMAIL_ADDRESS
     msg['To'] = recipient_email
     msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
-    
+    msg.attach(MIMEText(html_body, 'html'))
+
     try:
         with smtplib.SMTP('smtp.gmail.com', 587) as server:
             server.starttls()
             server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            text = msg.as_string()
-            server.sendmail(GMAIL_ADDRESS, recipient_email, text)
-        logger.info(f"Successfully sent daily report email to {recipient_email}")
+            server.send_message(msg)
+        logger.info(f"Successfully sent daily email report to {recipient_email}")
     except Exception as e:
         logger.exception(f"Failed to send daily report email: {e}")
 
-
 def send_daily_whatsapp(summary: dict, recipient_phone: str) -> None:
     """
-    Sends daily summary via WhatsApp using Twilio
+    Sends daily summary via WhatsApp using Twilio, formatted as a warm consultative briefing.
     """
     if not twilio_client or not TWILIO_WHATSAPP_NUMBER:
         logger.warning("Twilio not configured — skipping WhatsApp message")
         return
-    
-    # Build message body
-    body = f"📊 Daily Business Report - {summary['date']}\n"
-    body += "--------------------------------\n"
-    body += f"Total Profit Today: Rs {summary['total_profit_today']:,.2f}\n\n"
-    
+
+    health = summary.get("health_score") or {}
+    score = health.get("score")
+    label = health.get("label", "Pending")
+    top_risk = summary.get("top_risk")
+    top_opportunity = summary.get("top_opportunity")
+
+    body = "🩺 *Your Business Pulse*\n"
+    body += f"_{summary['date']}_\n\n"
+
+    if score is not None:
+        body += f"*Health Score: {int(score)}/100* — {label}\n\n"
+
+    body += f"💰 *Profit Today:* Rs {summary['total_profit_today']:,.2f}\n\n"
+
+    if top_risk:
+        body += f"⚠️ *Top Risk*\n{top_risk}\n\n"
+
+    if top_opportunity:
+        body += f"↗️ *Top Opportunity*\n{top_opportunity}\n\n"
+
     if summary['top_selling_items']:
-        body += "🏆 Top Selling Items:\n"
+        body += "🏆 *Top Sellers*\n"
         for i, item in enumerate(summary['top_selling_items'][:5], 1):
-            body += f"{i}. {item['product']}: {item['units_sold']} units, Rs {item['revenue']:,.2f}\n"
+            body += f"{i}. {item['product']} — {item['units_sold']} units, Rs {item['revenue']:,.2f}\n"
         body += "\n"
-    
+
     if summary['restocked_items_today']:
-        body += "📦 Restocked Items:\n"
+        body += "📦 *Restocked Today*\n"
         for item in summary['restocked_items_today']:
-            body += f"- {item['product']}: {item['qty']} units\n"
+            body += f"• {item['product']}: {item['qty']} units\n"
     else:
-        body += "📦 No items restocked today.\n"
-    
+        body += "📦 No restocks logged today.\n"
+
+    body += "\n_Your business has a pulse. We help you read it._"
+
     try:
         message = twilio_client.messages.create(
             from_=f"whatsapp:{TWILIO_WHATSAPP_NUMBER}",
@@ -2695,7 +2778,88 @@ def analyze_dead_inventory(user_id: str, authenticated_supabase_client) -> dict:
         "threshold_days": DEAD_INVENTORY_MIN_DAYS,
         "products_analyzed": len(inventory),
     }
+def analyze_supplier_opportunities(user_id: str, authenticated_supabase_client) -> dict:
+    """
+    Supplier Intelligence — REAL current costs from inventory, compared
+    against a MOCK alternate supplier (see mock_supplier_data.py).
 
+    The mock/real boundary: this function loads real inventory data
+    (current_unit_cost, monthly sales volume) and passes only that real
+    data into the mock module. The mock module returns a synthetic
+    alternate supplier. Every item in this function's output carries
+    is_demo_data=True so the frontend must label it clearly.
+
+    This function does NOT feed into calculate_root_causes,
+    generate_action_plan, predict_cash_flow, get_inventory_optimizer,
+    or analyze_dead_inventory — it is entirely standalone.
+    """
+    sales, inventory = load_data(user_id)
+
+    if inventory.empty:
+        return {
+            "insufficient_data": True,
+            "data_sufficiency_note": "No inventory data available for supplier comparison.",
+            "items": [],
+            "total_monthly_savings": 0.0,
+            "total_annual_savings": 0.0,
+            "is_demo_data": True,
+        }
+
+    # Real monthly sales volume per product, if sales history exists
+    if not sales.empty:
+        max_date = sales["date"].max()
+        trailing_start = max_date - pd.Timedelta(days=29)
+        trailing = sales[sales["date"] >= trailing_start]
+        monthly_units_by_product = (
+            trailing.groupby("product")["units_sold"].sum().to_dict()
+        )
+    else:
+        monthly_units_by_product = {}
+
+    items = []
+    total_monthly_savings = 0.0
+    total_annual_savings = 0.0
+
+    for _, row in inventory.iterrows():
+        product = row["product"]
+        current_unit_cost = float(row["unit_cost"])
+        monthly_units = float(monthly_units_by_product.get(product, 0))
+
+        comparison = get_supplier_comparison(product, current_unit_cost)
+        if not comparison.get("has_comparison"):
+            continue
+
+        savings = calculate_supplier_savings(
+            current_unit_cost=current_unit_cost,
+            alternate_cost=comparison["alternate_supplier_cost"],
+            monthly_units=monthly_units,
+        )
+
+        total_monthly_savings += savings["monthly_savings"]
+        total_annual_savings += savings["annual_savings"]
+
+        items.append({
+            **comparison,
+            "monthly_units_basis": monthly_units,
+            "monthly_savings": savings["monthly_savings"],
+            "annual_savings": savings["annual_savings"],
+        })
+
+    # Sort by highest annual savings first
+    items.sort(key=lambda x: x["annual_savings"], reverse=True)
+
+    return {
+        "insufficient_data": False,
+        "items": items,
+        "total_monthly_savings": round(total_monthly_savings, 2),
+        "total_annual_savings": round(total_annual_savings, 2),
+        "is_demo_data": True,
+        "demo_data_note": (
+            "Supplier names and alternate pricing shown here are demonstration "
+            "data. Current costs are from your real inventory; connect a real "
+            "supplier data source to replace the comparison figures."
+        ),
+    }
 
 if __name__ == "__main__":
     import json
